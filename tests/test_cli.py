@@ -4,6 +4,9 @@
 import contextlib
 import csv
 import io
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -394,10 +397,10 @@ class TestSummaryOutputFormat(unittest.TestCase):
             handle.write(self.HEADER)
             handle.writelines(rows)
 
-    def run_summary(self, student_id):
+    def run_summary(self, student_id, *args):
         argv = [
             "grade_tracker", "--data", str(self.data_path),
-            "summary", student_id,
+            "summary", student_id, *args,
         ]
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -438,6 +441,299 @@ class TestSummaryOutputFormat(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("Semester 1 (SGPA: 9.5)", stdout)
         self.assertIn("CGPA: 9.5", stdout)
+
+
+class TestJsonOutput(unittest.TestCase):
+    """Machine-readable ``--format json`` contracts for read-only commands."""
+
+    HEADER = "student_id,subject,score,max_score,date,credits,semester\n"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.data_path = Path(self.temp_dir.name) / "grades.csv"
+
+    def write_csv(self, rows, header=None):
+        self.data_path.write_text(
+            (self.HEADER if header is None else header) + "".join(rows),
+            encoding="utf-8",
+            newline="",
+        )
+
+    def run_cli(self, *args):
+        argv = ["grade_tracker", "--data", str(self.data_path), *args]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch("sys.argv", argv),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                main()
+            except SystemExit as exc:
+                return exc.code, stdout.getvalue(), stderr.getvalue()
+
+        return 0, stdout.getvalue(), stderr.getvalue()
+
+    def parse_json_stdout(self, stdout):
+        self.assertTrue(stdout.endswith("\n"))
+        return json.loads(stdout)
+
+    def test_list_json_schema_and_values(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Physics,85,100,2025-01-16,3,1\n",
+        ])
+
+        code, stdout, stderr = self.run_cli("list", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["command"], "list")
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(len(payload["grades"]), 2)
+        first = payload["grades"][0]
+        self.assertEqual(
+            first,
+            {
+                "student_id": "S1",
+                "subject": "Mathematics",
+                "score": 95.0,
+                "max_score": 100.0,
+                "date": "2025-01-15",
+                "credits": 3.0,
+                "semester": "1",
+                "percentage": 95.0,
+                "letter_grade": "A",
+            },
+        )
+        self.assertIsInstance(first["score"], float)
+        self.assertIsInstance(first["semester"], str)
+
+    def test_list_json_empty_dataset(self):
+        code, stdout, stderr = self.run_cli("list", "--format", "json")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(self.parse_json_stdout(stdout), {
+            "command": "list",
+            "count": 0,
+            "grades": [],
+        })
+
+    def test_summary_json_schema_sgpa_and_cgpa(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Physics,85,100,2025-01-16,3,1\n",
+            "S1,History,85,100,2025-10-24,4,2\n",
+        ])
+
+        code, stdout, stderr = self.run_cli("summary", "S1", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["command"], "summary")
+        self.assertEqual(payload["student_id"], "S1")
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(payload["cgpa"], 9.3)
+        self.assertEqual(len(payload["semesters"]), 2)
+        self.assertEqual(payload["semesters"][0]["semester"], "1")
+        self.assertEqual(payload["semesters"][0]["sgpa"], 9.5)
+        self.assertEqual(len(payload["semesters"][0]["grades"]), 2)
+        self.assertEqual(payload["semesters"][1]["semester"], "2")
+        self.assertEqual(payload["semesters"][1]["sgpa"], 9.0)
+        self.assertEqual(len(payload["grades"]), 3)
+
+    def test_summary_json_empty_student_uses_null_and_empty_arrays(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        code, stdout, stderr = self.run_cli("summary", "UNKNOWN", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload, {
+            "command": "summary",
+            "student_id": "UNKNOWN",
+            "count": 0,
+            "cgpa": None,
+            "semesters": [],
+            "grades": [],
+        })
+
+    def test_average_json_schema_and_null_for_no_matches(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S2,Mathematics,70,100,2025-01-16,3,1\n",
+        ])
+
+        code, stdout, stderr = self.run_cli("average", "Mathematics", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(payload, {
+            "command": "average",
+            "subject": "Mathematics",
+            "average": 82.5,
+            "count": 2,
+        })
+        self.assertIsInstance(payload["average"], float)
+
+        code, stdout, stderr = self.run_cli("average", "Physics", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(payload, {
+            "command": "average",
+            "subject": "Physics",
+            "average": None,
+            "count": 0,
+        })
+
+    def test_validate_json_success_and_failure(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        code, stdout, stderr = self.run_cli("validate", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(payload["command"], "validate")
+        self.assertIs(payload["valid"], True)
+        self.assertEqual(payload["error_count"], 0)
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["file"], str(self.data_path))
+
+        self.write_csv(["S1,Mathematics,abc,100,2025-01-15,3,1\n"])
+
+        code, stdout, stderr = self.run_cli("validate", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual((code, stderr), (1, ""))
+        self.assertIs(payload["valid"], False)
+        self.assertEqual(payload["error_count"], 1)
+        self.assertEqual(payload["errors"], [
+            "row 2, field score: 'abc' is not a numeric score",
+        ])
+
+    def test_malformed_csv_json_reports_error_not_empty_success(self):
+        self.data_path.write_text(
+            self.HEADER + "S1,Mathematics,abc,100,2025-01-15,3,1\n",
+            encoding="utf-8",
+            newline="",
+        )
+
+        code, stdout, stderr = self.run_cli("list", "--format", "json")
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["command"], "list")
+        self.assertEqual(payload["error"]["code"], "input_error")
+        self.assertIn("row 2 cannot be loaded", payload["error"]["message"])
+        self.assertNotIn("grades", payload)
+
+    def test_utf8_bom_header_is_normalized(self):
+        self.data_path.write_bytes(
+            (
+                "\ufeff" + self.HEADER + "S1,Mathematics,95,100,2025-01-15,3,1\n"
+            ).encode("utf-8")
+        )
+
+        code, stdout, stderr = self.run_cli("list", "--format", "json")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        payload = self.parse_json_stdout(stdout)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["grades"][0]["subject"], "Mathematics")
+
+    def test_missing_required_columns_json_reports_error(self):
+        self.data_path.write_text(
+            "student_id,subject,score,date,credits,semester\n"
+            "S1,Mathematics,95,2025-01-15,3,1\n",
+            encoding="utf-8",
+            newline="",
+        )
+
+        code, stdout, stderr = self.run_cli(
+            "average", "Mathematics", "--format", "json"
+        )
+        payload = self.parse_json_stdout(stdout)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["error"]["code"], "input_error")
+        self.assertIn(
+            "missing required column(s): max_score", payload["error"]["message"]
+        )
+
+    def test_default_human_output_is_unchanged(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        code, stdout, stderr = self.run_cli("list")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Student ID", stdout)
+        self.assertIn("Mathematics", stdout)
+
+        code, stdout, stderr = self.run_cli("summary", "S1")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("CGPA: 10.0", stdout)
+
+    def test_invalid_format_is_rejected_by_argparse(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        code, stdout, stderr = self.run_cli("list", "--format", "yaml")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("invalid choice", stderr)
+
+    def test_json_stdout_contains_only_json(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        for command in (
+            ("list",),
+            ("summary", "S1"),
+            ("average", "Mathematics"),
+            ("validate",),
+        ):
+            with self.subTest(command=command):
+                code, stdout, stderr = self.run_cli(*command, "--format", "json")
+                self.assertEqual(code, 0)
+                self.assertEqual(stderr, "")
+                self.assertEqual(stdout.count("\n"), 1)
+                json.loads(stdout)
+
+    def test_subprocess_entrypoint_json_contract(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "grade_tracker",
+                "--data",
+                str(self.data_path),
+                "list",
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["grades"][0]["subject"], "Mathematics")
 
 
 class TestCmdList(unittest.TestCase):

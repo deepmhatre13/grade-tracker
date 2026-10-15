@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import re
@@ -24,7 +25,133 @@ from grade_tracker.export import build_html
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "grades.csv"
 
+# Output modes for read-only commands.  "human" preserves the original text
+# output; "json" emits one JSON document on stdout and sends diagnostics to
+# stderr.
+HUMAN_FORMAT = "human"
+JSON_FORMAT = "json"
 
+
+
+
+def _format_name(args, default=HUMAN_FORMAT):
+    """Return the requested output format, defaulting to human-readable text.
+
+    Older commands do not have a ``format`` attribute when invoked directly in
+    tests, so the helper accepts both the argparse namespace and objects that
+    simply omit the option.
+    """
+    return getattr(args, "format", default) or default
+
+
+def _emit_json(payload):
+    """Write exactly one machine-readable JSON document to stdout.
+
+    The payload is serialized with :mod:`json` rather than assembled manually.
+    ``sort_keys=True`` and a fixed separator keep output deterministic for
+    scripts and tests; ``ensure_ascii=False`` preserves readable subject names
+    while remaining valid UTF-8 JSON.
+    """
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _json_input_error(exc):
+    """Convert a CSV/Unicode/OSError input failure into a JSON-ready payload."""
+    return {
+        "command": None,
+        "error": {
+            "code": "input_error",
+            "message": str(exc),
+        },
+    }
+
+
+def _load_grades_for_json(csv_path, command):
+    """Load grades for JSON mode, refusing malformed input instead of hiding it.
+
+    ``load_grades`` intentionally skips legacy/malformed rows for the original
+    human-readable commands. That behavior is unsafe for machine consumers,
+    because a malformed CSV could look like a valid empty dataset. JSON mode
+    therefore raises a caller-visible error for malformed visible data rows.
+
+    A file that does not exist is treated as an empty dataset, matching the
+    existing loader contract. ``validate --format json`` reports the missing
+    file with its normal exit code 1.
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        return []
+
+    grades = []
+    try:
+        with open(path, mode="r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames
+            required = ("student_id", "subject", "score", "max_score", "date")
+            if fieldnames is None:
+                raise ValueError(f"{path}: file is empty (no CSV header)")
+            normalized_fieldnames = [
+                fieldname.lstrip("\ufeff").strip() if fieldname else fieldname
+                for fieldname in fieldnames
+            ]
+            missing = [name for name in required if name not in normalized_fieldnames]
+            if missing:
+                raise ValueError(
+                    f"{path}: missing required column(s): {', '.join(missing)}"
+                )
+            if len(set(normalized_fieldnames)) != len(normalized_fieldnames):
+                raise ValueError(f"{path}: duplicate CSV column name")
+            normalized_rows = [
+                dict(zip(normalized_fieldnames, row.values())) for row in reader
+            ]
+
+            for row_number, row in enumerate(normalized_rows, start=2):
+                if not row:
+                    continue
+                raw_values = [value for value in row.values() if value is not None]
+                if not any(value.strip() for value in raw_values):
+                    continue  # Blank physical lines are ignored, as in the loader.
+                try:
+                    grades.append(
+                        {
+                            "student_id": row["student_id"].strip(),
+                            "subject": row["subject"].strip(),
+                            "score": float(row["score"]),
+                            "max_score": float(row["max_score"]),
+                            "date": row.get("date", "").strip(),
+                            "credits": float(row.get("credits", 3.0)),
+                            "semester": str(row.get("semester", "1")).strip(),
+                        }
+                    )
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise ValueError(
+                        f"{path}: row {row_number} cannot be loaded ({exc}); "
+                        "run 'validate' for details"
+                    ) from exc
+    except (UnicodeDecodeError, OSError, csv.Error) as exc:
+        raise ValueError(f"{path}: cannot read grades CSV ({exc})") from exc
+
+    return grades
+
+
+def _grade_json_record(grade, semester=None):
+    """Serialize one loaded grade record with stable field names and types."""
+    semester_value = grade["semester"] if semester is None else semester
+    return {
+        "student_id": grade["student_id"],
+        "subject": grade["subject"],
+        "score": grade["score"],
+        "max_score": grade["max_score"],
+        "date": grade["date"] or None,
+        "credits": grade["credits"],
+        "semester": semester_value,
+        "percentage": round(float(percentage(grade["score"], grade["max_score"])), 1)
+        if grade["max_score"] > 0
+        else None,
+        "letter_grade": letter_grade(grade["score"], grade["max_score"])
+        if grade["max_score"] > 0
+        else None,
+    }
 
 
 def _lock_path_for(csv_path):
@@ -837,6 +964,11 @@ def audit_grades_csv(csv_path):
         return [f"{path}: cannot read file ({exc})"]
     except csv.Error as exc:
         return [f"{path}: malformed CSV ({exc})"]
+    except Exception as exc:
+        return [f"{path}: unexpected CSV parsing error ({exc})"]
+
+    except csv.Error as exc:
+        return [f"{path}: malformed CSV ({exc})"]
 
     return diagnostics
 
@@ -844,8 +976,21 @@ def audit_grades_csv(csv_path):
 def cmd_validate(args):
     """Audit the grades CSV and report integrity problems, read-only."""
     diagnostics = audit_grades_csv(args.data)
+    as_json = _format_name(args) == JSON_FORMAT
 
     if diagnostics:
+        if as_json:
+            _emit_json(
+                {
+                    "command": "validate",
+                    "valid": False,
+                    "error_count": len(diagnostics),
+                    "errors": diagnostics,
+                    "file": str(args.data),
+                }
+            )
+            raise SystemExit(1)
+
         for message in diagnostics:
             print(f"Error: {message}", file=sys.stderr)
         count = len(diagnostics)
@@ -853,11 +998,41 @@ def cmd_validate(args):
         print(f"Validation failed: {count} {noun} found.", file=sys.stderr)
         raise SystemExit(1)
 
+    if as_json:
+        _emit_json(
+            {
+                "command": "validate",
+                "valid": True,
+                "error_count": 0,
+                "errors": [],
+                "file": str(args.data),
+            }
+        )
+        raise SystemExit(0)
+
     print(f"OK: {args.data} passed validation.")
     raise SystemExit(0)
 
 
 def cmd_list(args):
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "list")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "list"
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        _emit_json(
+            {
+                "command": "list",
+                "count": len(grades),
+                "grades": [_grade_json_record(g) for g in grades],
+            }
+        )
+        return
+
     grades = load_grades(args.data)
     if not grades:
         print("No grades found.")
@@ -871,6 +1046,58 @@ def cmd_list(args):
 
 
 def cmd_summary(args):
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "summary")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "summary"
+            payload["student_id"] = args.student_id
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        student_grades = [
+            g for g in grades if g["student_id"] == args.student_id
+        ]
+        if not student_grades:
+            _emit_json(
+                {
+                    "command": "summary",
+                    "student_id": args.student_id,
+                    "count": 0,
+                    "cgpa": None,
+                    "semesters": [],
+                    "grades": [],
+                }
+            )
+            return
+
+        semesters = sorted({g["semester"] for g in student_grades})
+        _emit_json(
+            {
+                "command": "summary",
+                "student_id": args.student_id,
+                "count": len(student_grades),
+                "cgpa": cgpa(grades, args.student_id),
+                "semesters": [
+                    {
+                        "semester": sem,
+                        "sgpa": sgpa(grades, args.student_id, sem),
+                        "grades": [
+                            _grade_json_record(g, str(sem))
+                            for g in student_grades
+                            if g["semester"] == sem
+                        ],
+                    }
+                    for sem in semesters
+                ],
+                "grades": [
+                    _grade_json_record(g) for g in student_grades
+                ],
+            }
+        )
+        return
+
     grades = load_grades(args.data)
     student_grades = [g for g in grades if g["student_id"] == args.student_id]
     if not student_grades:
@@ -896,6 +1123,31 @@ def cmd_summary(args):
 
 
 def cmd_average(args):
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "average")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "average"
+            payload["subject"] = args.subject
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        avg = subject_average(grades, args.subject)
+        _emit_json(
+            {
+                "command": "average",
+                "subject": args.subject,
+                "average": avg,
+                "count": sum(
+                    1
+                    for g in grades
+                    if g["subject"].strip().lower() == args.subject.strip().lower()
+                ),
+            }
+        )
+        return
+
     grades = load_grades(args.data)
     avg = subject_average(grades, args.subject)
     if avg is None:
@@ -964,6 +1216,17 @@ def cmd_edit(args):
     )
 
 
+def _add_format_argument(parser):
+    """Add the shared ``--format`` option to a read-only command parser."""
+    parser.add_argument(
+        "--format",
+        choices=(HUMAN_FORMAT, JSON_FORMAT),
+        default=HUMAN_FORMAT,
+        dest="format",
+        help="Output format: human (default) or json",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
     parser.add_argument("--data", default=DEFAULT_DATA_PATH, help="Path to grades.csv")
@@ -971,16 +1234,19 @@ def main():
 
     # list
     p_list = subparsers.add_parser("list", help="List all grades")
+    _add_format_argument(p_list)
     p_list.set_defaults(func=cmd_list)
 
     # summary
     p_summary = subparsers.add_parser("summary", help="Show summary for a student")
     p_summary.add_argument("student_id", help="Student ID")
+    _add_format_argument(p_summary)
     p_summary.set_defaults(func=cmd_summary)
 
     # average
     p_avg = subparsers.add_parser("average", help="Show average for a subject")
     p_avg.add_argument("subject", help="Subject name")
+    _add_format_argument(p_avg)
     p_avg.set_defaults(func=cmd_average)
 
     # export
@@ -1052,6 +1318,7 @@ def main():
     p_validate = subparsers.add_parser(
         "validate", help="Audit the grades CSV for integrity problems (read-only)"
     )
+    _add_format_argument(p_validate)
     p_validate.set_defaults(func=cmd_validate)
 
     args = parser.parse_args()
