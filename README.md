@@ -24,13 +24,38 @@ On Windows, use `python` instead of `python3`.
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester>` | Adds a mark |
 | `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
 | `export [--output path]` | Writes an HTML report, `reports/index.html` by default |
+
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
+
+| `validate` | Audits the CSV for malformed or invalid records, without changing the file |
+| `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
+| `restore <backup_path>` | Verifies and restores a backup to the grade data file |
+
 
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
 
 The whole update runs as one transaction: the command takes the same cross-process lock `add` uses, re-reads the file, applies the change in memory, validates it with the same rules as `add` (score between 0 and `max_score`, `max_score` greater than 0, `date` in `YYYY-MM-DD`), checks that the resulting identity does not duplicate a *different* record, then writes a temporary file next to the CSV, flushes it, and atomically replaces the original. If the target is missing, several records match it (ambiguous), validation fails, or the write fails, the command exits 2 with an error on stderr and the file is left byte-for-byte unchanged. Retakes in a different semester or on a different date are still allowed, because they are different assessments.
 
 `validate` is strictly read-only: it never rewrites, repairs, or deletes records, so file timestamps and bytes are untouched. Each problem is reported on stderr with its CSV row number (the header is row 1, the first data record is row 2), the affected field, and a reason. It exits 0 when the file is clean and 1 when any problem is found. Rows that `list`/`summary` would silently skip (a blank student ID or subject, a non-numeric score, and so on) are flagged here instead of being dropped. Legacy rows that simply omit the optional `credits` or `semester` columns are still accepted, matching the loader's documented defaults of 3.0 credits and semester 1.
+
+`backup` creates a consistent, verified snapshot of the active grade data:
+- Backups are stored in a `backups/` directory adjacent to the data CSV (e.g. `data/backups/`).
+- Filenames follow the timestamped convention `grades-YYYYMMDDTHHMMSSZ.csv` and are accompanied by a JSON manifest `grades-YYYYMMDDTHHMMSSZ.json`. If multiple backups occur within the same second, an incrementing numerical suffix (`-1`, `-2`, ...) ensures uniqueness without overwriting.
+- The manifest records `format_version` ("1.0"), `schema_version` ("1.0"), UTC creation time `created_at` (ISO 8601), `source_file`, `bytes`, record count, canonical CSV `header`, and the exact `sha256` digest of the backup CSV.
+- Backup acquisition coordinates under the target CSV's advisory inter-process lock (`_InterProcessLock`), ensuring no backup captures a partially written or concurrent mutation.
+- The source data file is audited (`audit_grades_csv`) before backup generation; if the file is missing or invalid, backup aborts with exit code 1 and no backup artifact is left behind.
+
+`restore <backup_path>` restores a backup to the configured destination data CSV:
+- `<backup_path>` may point either to the backup CSV or its companion JSON manifest.
+- Before modifying the destination, the command:
+  1. Validates manifest existence, syntax, supported format version ("1.0"), and schema version ("1.0").
+  2. Verifies the backup data file's SHA-256 checksum matches the manifest digest.
+  3. Validates the header and audits all records using `audit_grades_csv`.
+  4. Prevents restoring a backup directly over its own source files.
+- It then acquires the destination file's advisory inter-process lock, re-verifies destination collision and checksum integrity under lock, writes restored contents to a temporary file in the destination directory, flushes and `fsync`s the temporary file, and atomically replaces the destination (`os.replace`).
+- Temporary files are cleaned up on any failure, leaving the original destination byte-for-byte unchanged.
+- If the destination does not yet exist, its directory structure is created and the file is safely established.
+- Concurrency & atomicity limitations: Advisory locks protect coordinating processes using this CLI. Durability is bounded by the underlying OS filesystem guarantees.
 
 ## How it's supposed to work
 
