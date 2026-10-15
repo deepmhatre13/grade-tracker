@@ -164,6 +164,96 @@ def letter_grade(score, max_score=100):
     return "F"
 
 
+def calculate_gpa_breakdown(grades):
+    """Calculates GPA breakdown and intermediate values for a pre-filtered list of grades.
+
+    Processes records in input order:
+    1. Evaluates percentage, letter grade, grade points, and credits for each record.
+    2. Deduplicates records using assessment_key:
+       - The first occurrence of an assessment key is included.
+       - Subsequent occurrences of the same assessment key are excluded as duplicates.
+       - Records with no determinate identity (assessment_key is None) are always included.
+    3. Accumulates weighted grade points (grade_points * credits) and credits for included records.
+    4. Computes the resulting GPA:
+       - None if no records are included.
+       - 0.0 if total_credits == 0.0.
+       - round(total_points / total_credits, 2) otherwise.
+
+    Returns:
+        dict:
+            - 'records': list of dicts with assessment-level details and inclusion status.
+            - 'total_points': float, aggregate numerator (sum of points * credits).
+            - 'total_credits': float, aggregate denominator (sum of credits).
+            - 'gpa': float or None, final rounded GPA.
+    """
+    seen_keys = set()
+    records_breakdown = []
+    total_points = 0.0
+    total_credits = 0.0
+    included_count = 0
+
+    for g in grades:
+        score = g.get("score")
+        max_score = g.get("max_score")
+        key = assessment_key(g)
+        c = _credit(g)
+
+        # Calculate percentage, letter grade, and grade points
+        try:
+            pct_val = float(percentage(score, max_score)) if max_score > 0 else 0.0
+            lg = letter_grade(score, max_score)
+        except (ValueError, TypeError, KeyError):
+            pct_val = 0.0
+            lg = "F"
+
+        pts = GRADE_POINTS.get(lg, 0.0)
+        weighted_points = pts * c
+
+        if key is not None and key in seen_keys:
+            included = False
+            exclusion_reason = "Duplicate assessment in calculation scope"
+        else:
+            if key is not None:
+                seen_keys.add(key)
+            included = True
+            exclusion_reason = None
+            total_points += weighted_points
+            total_credits += c
+            included_count += 1
+
+        record_entry = {
+            "record": g,
+            "student_id": g.get("student_id"),
+            "subject": g.get("subject"),
+            "semester": str(g.get("semester", "")),
+            "date": g.get("date", ""),
+            "score": score,
+            "max_score": max_score,
+            "credits": c,
+            "percentage": pct_val,
+            "letter_grade": lg,
+            "grade_points": pts,
+            "weighted_points": weighted_points,
+            "included": included,
+            "exclusion_reason": exclusion_reason,
+        }
+        records_breakdown.append(record_entry)
+
+    if included_count == 0:
+        calculated_gpa = None
+    elif total_credits == 0.0:
+        calculated_gpa = 0.0
+    else:
+        calculated_gpa = round(total_points / total_credits, 2)
+
+    return {
+        "records": records_breakdown,
+        "total_points": total_points,
+        "total_credits": total_credits,
+        "gpa": calculated_gpa,
+    }
+
+
 def sgpa(grades, student_id=None, semester=None):
     """Calculates Semester Grade Point Average on a 10.0 scale.
 
@@ -181,22 +271,7 @@ def sgpa(grades, student_id=None, semester=None):
     if semester is not None:
         grades = [g for g in grades if str(g.get("semester", "")) == str(semester)]
 
-    grades = _dedupe_assessments(grades)
-
-    if not grades:
-        return None
-
-    total_points = 0.0
-    total_credits = 0.0
-    for g in grades:
-        c = _credit(g)
-        pts = GRADE_POINTS.get(letter_grade(g["score"], g["max_score"]), 0.0)
-        total_points += pts * c
-        total_credits += c
-
-    if total_credits == 0:
-        return 0.0
-    return round(total_points / total_credits, 2)
+    return calculate_gpa_breakdown(grades)["gpa"]
 
 
 def cgpa(grades, student_id=None):
@@ -214,22 +289,63 @@ def cgpa(grades, student_id=None):
     if student_id is not None:
         grades = [g for g in grades if g.get("student_id") == student_id]
 
-    grades = _dedupe_assessments(grades)
+    return calculate_gpa_breakdown(grades)["gpa"]
 
-    if not grades:
-        return None
 
-    total_points = 0.0
-    total_credits = 0.0
-    for g in grades:
-        c = _credit(g)
-        pts = GRADE_POINTS.get(letter_grade(g["score"], g["max_score"]), 0.0)
-        total_points += pts * c
-        total_credits += c
+def explain_student_gpa(grades, student_id, semester=None):
+    """Generates structured GPA explanation for a student.
 
-    if total_credits == 0:
-        return 0.0
-    return round(total_points / total_credits, 2)
+    Returns a dict explaining:
+      - student_id: ID of the student.
+      - requested_semester: Filtered semester or None.
+      - student_exists: Boolean whether any record exists for student_id.
+      - semester_found: Boolean whether student has records in requested_semester (or True if semester is None).
+      - semesters: Dict mapping semester name to its calculation breakdown.
+      - cgpa: Cumulative GPA calculation breakdown across all student records.
+    """
+    student_records = [g for g in grades if g.get("student_id") == student_id]
+    if not student_records:
+        return {
+            "student_id": student_id,
+            "requested_semester": str(semester) if semester is not None else None,
+            "student_exists": False,
+            "semester_found": False,
+            "semesters": {},
+            "cgpa": {
+                "records": [],
+                "total_points": 0.0,
+                "total_credits": 0.0,
+                "gpa": None,
+            },
+        }
+
+    # CGPA breakdown uses all student records
+    cgpa_breakdown = calculate_gpa_breakdown(student_records)
+
+    # Determine unique semesters preserving order of first appearance or sorted
+    all_semesters = sorted(list(set(str(g.get("semester", "")) for g in student_records)))
+
+    sem_filter_str = str(semester) if semester is not None else None
+    if sem_filter_str is not None:
+        semester_found = sem_filter_str in all_semesters
+        semesters_to_explain = [sem_filter_str] if semester_found else []
+    else:
+        semester_found = True
+        semesters_to_explain = all_semesters
+
+    semesters_breakdown = {}
+    for sem in semesters_to_explain:
+        sem_records = [g for g in student_records if str(g.get("semester", "")) == sem]
+        semesters_breakdown[sem] = calculate_gpa_breakdown(sem_records)
+
+    return {
+        "student_id": student_id,
+        "requested_semester": sem_filter_str,
+        "student_exists": True,
+        "semester_found": semester_found,
+        "semesters": semesters_breakdown,
+        "cgpa": cgpa_breakdown,
+    }
 
 
 def subject_average(grades, subject):

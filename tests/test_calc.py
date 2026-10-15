@@ -2,7 +2,16 @@
 
 import unittest
 from decimal import Decimal
-from grade_tracker.calc import assessment_key, letter_grade, cgpa, percentage, sgpa, subject_average
+from grade_tracker.calc import (
+    assessment_key,
+    calculate_gpa_breakdown,
+    cgpa,
+    explain_student_gpa,
+    letter_grade,
+    percentage,
+    sgpa,
+    subject_average,
+)
 
 
 class TestGradeCalculations(unittest.TestCase):
@@ -478,6 +487,98 @@ class TestGradeRoundingPrecision(unittest.TestCase):
         ]
         # First record wins: (10*3 + 9*3)/6 = 9.5
         self.assertEqual(sgpa(grades, "S1", 1), 9.5)
+
+
+class TestGpaExplainCalculation(unittest.TestCase):
+    """Direct tests for calculate_gpa_breakdown and explain_student_gpa."""
+
+    def test_calculate_gpa_breakdown_per_assessment(self):
+        grades = [
+            {
+                "student_id": "S1",
+                "subject": "Math",
+                "score": 95,
+                "max_score": 100,
+                "credits": 3.0,
+                "semester": "1",
+                "date": "2025-01-15",
+            },
+            {
+                "student_id": "S1",
+                "subject": "Math",
+                "score": 70,
+                "max_score": 100,
+                "credits": 3.0,
+                "semester": "1",
+                "date": "2025-01-15",
+            },
+            {
+                "student_id": "S1",
+                "subject": "Physics",
+                "score": 85,
+                "max_score": 100,
+                "credits": 4.0,
+                "semester": "1",
+                "date": "2025-01-16",
+            },
+        ]
+        breakdown = calculate_gpa_breakdown(grades)
+        self.assertEqual(len(breakdown["records"]), 3)
+
+        # First Math is included
+        r0 = breakdown["records"][0]
+        self.assertTrue(r0["included"])
+        self.assertIsNone(r0["exclusion_reason"])
+        self.assertEqual(r0["grade_points"], 10.0)
+        self.assertEqual(r0["weighted_points"], 30.0)
+
+        # Duplicate Math is excluded
+        r1 = breakdown["records"][1]
+        self.assertFalse(r1["included"])
+        self.assertEqual(r1["exclusion_reason"], "Duplicate assessment in calculation scope")
+        self.assertEqual(r1["grade_points"], 8.0)
+        self.assertEqual(r1["weighted_points"], 24.0)
+
+        # Physics is included
+        r2 = breakdown["records"][2]
+        self.assertTrue(r2["included"])
+        self.assertEqual(r2["grade_points"], 9.0)
+        self.assertEqual(r2["weighted_points"], 36.0)
+
+        # Aggregate numerator = 30 + 36 = 66, denominator = 3 + 4 = 7 -> GPA = 9.43
+        self.assertEqual(breakdown["total_points"], 66.0)
+        self.assertEqual(breakdown["total_credits"], 7.0)
+        self.assertEqual(breakdown["gpa"], 9.43)
+
+    def test_explain_student_gpa_semester_filter(self):
+        grades = [
+            {"student_id": "S1", "subject": "Math", "score": 95, "max_score": 100, "credits": 3.0, "semester": "1", "date": "2025-01-15"},
+            {"student_id": "S1", "subject": "History", "score": 85, "max_score": 100, "credits": 4.0, "semester": "2", "date": "2025-06-15"},
+        ]
+        explanation = explain_student_gpa(grades, "S1", semester="1")
+        self.assertTrue(explanation["student_exists"])
+        self.assertTrue(explanation["semester_found"])
+        self.assertEqual(list(explanation["semesters"].keys()), ["1"])
+
+        # Overall CGPA includes both semesters: (30 + 36) / 7 = 9.43
+        self.assertEqual(explanation["cgpa"]["gpa"], 9.43)
+        self.assertEqual(explanation["cgpa"]["total_credits"], 7.0)
+
+    def test_explain_student_gpa_nonexistent_student(self):
+        explanation = explain_student_gpa([], "UNKNOWN")
+        self.assertFalse(explanation["student_exists"])
+        self.assertFalse(explanation["semester_found"])
+        self.assertIsNone(explanation["cgpa"]["gpa"])
+
+    def test_explain_student_gpa_nonexistent_semester(self):
+        grades = [
+            {"student_id": "S1", "subject": "Math", "score": 95, "max_score": 100, "credits": 3.0, "semester": "1", "date": "2025-01-15"}
+        ]
+        explanation = explain_student_gpa(grades, "S1", semester="99")
+        self.assertTrue(explanation["student_exists"])
+        self.assertFalse(explanation["semester_found"])
+        self.assertEqual(explanation["semesters"], {})
+        self.assertEqual(explanation["cgpa"]["gpa"], 10.0)
 
 
 if __name__ == "__main__":

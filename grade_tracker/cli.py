@@ -17,6 +17,7 @@ from pathlib import Path
 from grade_tracker.calc import (
     assessment_key as calc_assessment_key,
     cgpa,
+    explain_student_gpa,
     letter_grade,
     percentage,
     sgpa,
@@ -1361,6 +1362,158 @@ def cmd_summary(args):
             print(f"  {g['subject']:<18}: {g['score']:.1f}/{g['max_score']:.1f} ({pct:.1f}%) -> {lg} (Credits: {g['credits']})")
 
 
+def cmd_explain(args):
+    """Explain GPA calculation breakdown for a student."""
+    requested_sem = args.semester
+
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "explain")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "explain"
+            payload["student_id"] = args.student_id
+            payload["semester"] = requested_sem
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        explanation = explain_student_gpa(grades, args.student_id, semester=requested_sem)
+        if not explanation["student_exists"]:
+            _emit_json(
+                {
+                    "command": "explain",
+                    "student_id": args.student_id,
+                    "semester": requested_sem,
+                    "student_exists": False,
+                    "semester_found": False,
+                    "cgpa": {
+                        "numerator": 0.0,
+                        "denominator": 0.0,
+                        "gpa": None,
+                    },
+                    "semesters": [],
+                }
+            )
+            return
+
+        if requested_sem is not None and not explanation["semester_found"]:
+            _emit_json(
+                {
+                    "command": "explain",
+                    "student_id": args.student_id,
+                    "semester": requested_sem,
+                    "student_exists": True,
+                    "semester_found": False,
+                    "cgpa": {
+                        "numerator": explanation["cgpa"]["total_points"],
+                        "denominator": explanation["cgpa"]["total_credits"],
+                        "gpa": explanation["cgpa"]["gpa"],
+                    },
+                    "semesters": [],
+                }
+            )
+            return
+
+        semesters_json = []
+        for sem, sem_data in explanation["semesters"].items():
+            sem_records_json = []
+            for r in sem_data["records"]:
+                sem_records_json.append(
+                    {
+                        "student_id": r["student_id"],
+                        "subject": r["subject"],
+                        "semester": r["semester"],
+                        "date": r["date"] or None,
+                        "score": r["score"],
+                        "max_score": r["max_score"],
+                        "credits": r["credits"],
+                        "percentage": round(r["percentage"], 1),
+                        "letter_grade": r["letter_grade"],
+                        "grade_points": r["grade_points"],
+                        "weighted_points": r["weighted_points"],
+                        "included": r["included"],
+                        "exclusion_reason": r["exclusion_reason"],
+                    }
+                )
+            semesters_json.append(
+                {
+                    "semester": sem,
+                    "sgpa": sem_data["gpa"],
+                    "numerator": sem_data["total_points"],
+                    "denominator": sem_data["total_credits"],
+                    "records": sem_records_json,
+                }
+            )
+
+        _emit_json(
+            {
+                "command": "explain",
+                "student_id": args.student_id,
+                "semester": requested_sem,
+                "student_exists": True,
+                "semester_found": explanation["semester_found"],
+                "cgpa": {
+                    "numerator": explanation["cgpa"]["total_points"],
+                    "denominator": explanation["cgpa"]["total_credits"],
+                    "gpa": explanation["cgpa"]["gpa"],
+                },
+                "semesters": semesters_json,
+            }
+        )
+        return
+
+    grades = load_grades(args.data)
+    student_records = [g for g in grades if g.get("student_id") == args.student_id]
+    if not student_records:
+        print(f"No records found for student '{args.student_id}'.")
+        return
+
+    explanation = explain_student_gpa(grades, args.student_id, semester=requested_sem)
+    if requested_sem is not None and not explanation["semester_found"]:
+        print(f"No records found for student '{args.student_id}' in semester {requested_sem}.")
+        return
+
+    print(f"Explanation for Student: {args.student_id}")
+    if requested_sem is not None:
+        print(f"Filtered Semester: {requested_sem}")
+    print("=" * 60)
+
+    # Per-assessment breakdown by semester
+    for sem, sem_data in explanation["semesters"].items():
+        print(f"Semester {sem}:")
+        print(f"  {'Subject':<18} {'Score':<10} {'Max':<8} {'Pct':<8} {'Grade':<6} {'Pts':<6} {'Cr':<6} {'W.Pts':<8} {'Status'}")
+        print("  " + "-" * 75)
+        for r in sem_data["records"]:
+            pct_str = f"{r['percentage']:.1f}%"
+            status_str = "Included" if r["included"] else f"Excluded ({r['exclusion_reason']})"
+            print(
+                f"  {r['subject']:<18} {r['score']:<10.1f} {r['max_score']:<8.1f} {pct_str:<8} "
+                f"{r['letter_grade']:<6} {r['grade_points']:<6.1f} {r['credits']:<6.1f} {r['weighted_points']:<8.1f} {status_str}"
+            )
+
+        print("  " + "-" * 75)
+        num_str = f"{sem_data['total_points']:.2f}"
+        den_str = f"{sem_data['total_credits']:.2f}"
+        if sem_data["gpa"] is not None:
+            gpa_str = f"{sem_data['gpa']:.2f}"
+        else:
+            gpa_str = "Unavailable (no valid records)"
+        print(f"  Calculation: Numerator = {num_str}, Denominator = {den_str} -> SGPA = {gpa_str}")
+        print()
+
+    # Overall CGPA breakdown across all applicable records
+    cgpa_data = explanation["cgpa"]
+    print("Overall Cumulative (CGPA):")
+    cgpa_num_str = f"{cgpa_data['total_points']:.2f}"
+    cgpa_den_str = f"{cgpa_data['total_credits']:.2f}"
+    if cgpa_data["gpa"] is not None:
+        cgpa_str = f"{cgpa_data['gpa']:.2f}"
+    else:
+        cgpa_str = "Unavailable (no valid records)"
+    print(f"  Calculation: Numerator = {cgpa_num_str}, Denominator = {cgpa_den_str} -> CGPA = {cgpa_str}")
+    print("=" * 60)
+
+
 def cmd_average(args):
     if _format_name(args) == JSON_FORMAT:
         try:
@@ -1790,6 +1943,13 @@ def main():
     p_summary.add_argument("student_id", help="Student ID")
     _add_format_argument(p_summary)
     p_summary.set_defaults(func=cmd_summary)
+
+    # explain
+    p_explain = subparsers.add_parser("explain", help="Explain GPA calculation breakdown for a student")
+    p_explain.add_argument("student_id", help="Student ID")
+    p_explain.add_argument("--semester", default=None, help="Filter by semester")
+    _add_format_argument(p_explain)
+    p_explain.set_defaults(func=cmd_explain)
 
     # average
     p_avg = subparsers.add_parser("average", help="Show average for a subject")

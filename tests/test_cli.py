@@ -789,5 +789,179 @@ class TestCmdList(unittest.TestCase):
         self.assertIn("No grades found.", stdout)
 
 
+class TestCmdExplain(unittest.TestCase):
+    """Test suite for the explain subcommand in both human and JSON modes."""
+
+    HEADER = "student_id,subject,score,max_score,date,credits,semester\n"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.data_path = Path(self.temp_dir.name) / "grades.csv"
+
+    def write_csv(self, rows, header=None):
+        text = (self.HEADER if header is None else header) + "".join(rows)
+        self.data_path.write_text(text, encoding="utf-8", newline="")
+
+    def run_explain(self, *args):
+        argv = ["grade_tracker", "--data", str(self.data_path), "explain", *args]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch("sys.argv", argv),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                main()
+            except SystemExit as exc:
+                return exc.code, stdout.getvalue(), stderr.getvalue()
+
+        return 0, stdout.getvalue(), stderr.getvalue()
+
+    def test_explain_human_output_and_reconciliation(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Physics,85,100,2025-01-16,3,1\n",
+            "S1,History,85,100,2025-02-15,4,2\n",
+        ])
+        code, stdout, stderr = self.run_explain("S1")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Explanation for Student: S1", stdout)
+        self.assertIn("Semester 1:", stdout)
+        self.assertIn("Mathematics", stdout)
+        self.assertIn("95.0%", stdout)
+        self.assertIn("Included", stdout)
+        self.assertIn("Calculation: Numerator = 57.00, Denominator = 6.00 -> SGPA = 9.50", stdout)
+        self.assertIn("Semester 2:", stdout)
+        self.assertIn("Calculation: Numerator = 36.00, Denominator = 4.00 -> SGPA = 9.00", stdout)
+        self.assertIn("Overall Cumulative (CGPA):", stdout)
+        self.assertIn("Calculation: Numerator = 93.00, Denominator = 10.00 -> CGPA = 9.30", stdout)
+
+    def test_explain_semester_filter_does_not_narrow_cgpa(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,History,85,100,2025-02-15,4,2\n",
+        ])
+        code, stdout, stderr = self.run_explain("S1", "--semester", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Filtered Semester: 1", stdout)
+        self.assertIn("Semester 1:", stdout)
+        self.assertNotIn("Semester 2:", stdout)
+        # CGPA still uses both semesters: (30 + 36) / 7 = 9.43
+        self.assertIn("Calculation: Numerator = 66.00, Denominator = 7.00 -> CGPA = 9.43", stdout)
+
+    def test_explain_missing_student(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        code, stdout, stderr = self.run_explain("UNKNOWN")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No records found for student 'UNKNOWN'.", stdout)
+
+    def test_explain_student_with_nonexistent_semester(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        code, stdout, stderr = self.run_explain("S1", "--semester", "99")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No records found for student 'S1' in semester 99.", stdout)
+
+    def test_explain_deduplication_exclusion_reason(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Mathematics,70,100,2025-01-15,3,1\n",
+        ])
+        code, stdout, stderr = self.run_explain("S1")
+        self.assertEqual(code, 0)
+        self.assertIn("Included", stdout)
+        self.assertIn("Excluded (Duplicate assessment in calculation scope)", stdout)
+        # Only 95 counts: Numerator = 30, Denominator = 3 -> SGPA = 10.00
+        self.assertIn("Calculation: Numerator = 30.00, Denominator = 3.00 -> SGPA = 10.00", stdout)
+
+    def test_explain_read_only_preserves_csv(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        original_bytes = self.data_path.read_bytes()
+        code, _, _ = self.run_explain("S1")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.data_path.read_bytes(), original_bytes)
+
+    def test_explain_distinct_assessments_same_date(self):
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Physics,85,100,2025-01-15,3,1\n",
+        ])
+        code, stdout, stderr = self.run_explain("S1")
+        self.assertEqual(code, 0)
+        self.assertIn("Mathematics", stdout)
+        self.assertIn("Physics", stdout)
+        self.assertEqual(stdout.count("Included"), 2)
+        self.assertNotIn("Excluded", stdout)
+
+    def test_explain_zero_credits_denominator(self):
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,0,1\n"])
+        code, stdout, stderr = self.run_explain("S1")
+        self.assertEqual(code, 0)
+        self.assertIn("SGPA = 0.00", stdout)
+        self.assertIn("CGPA = 0.00", stdout)
+
+    def test_explain_json_mode(self):
+        import json
+        self.write_csv([
+            "S1,Mathematics,95,100,2025-01-15,3,1\n",
+            "S1,Mathematics,70,100,2025-01-15,3,1\n",
+            "S1,History,85,100,2025-02-15,4,2\n",
+        ])
+        code, stdout, stderr = self.run_explain("S1", "--format", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        data = json.loads(stdout)
+        self.assertEqual(data["command"], "explain")
+        self.assertEqual(data["student_id"], "S1")
+        self.assertTrue(data["student_exists"])
+        self.assertTrue(data["semester_found"])
+        self.assertEqual(data["cgpa"]["gpa"], 9.43)
+        self.assertEqual(len(data["semesters"]), 2)
+        sem1 = data["semesters"][0]
+        self.assertEqual(sem1["semester"], "1")
+        self.assertEqual(sem1["sgpa"], 10.0)
+        self.assertEqual(len(sem1["records"]), 2)
+        self.assertTrue(sem1["records"][0]["included"])
+        self.assertFalse(sem1["records"][1]["included"])
+        self.assertEqual(sem1["records"][1]["exclusion_reason"], "Duplicate assessment in calculation scope")
+
+    def test_explain_json_mode_nonexistent_student(self):
+        import json
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        code, stdout, stderr = self.run_explain("MISSING", "--format", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        data = json.loads(stdout)
+        self.assertFalse(data["student_exists"])
+        self.assertIsNone(data["cgpa"]["gpa"])
+
+    def test_explain_json_mode_nonexistent_semester(self):
+        import json
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        code, stdout, stderr = self.run_explain("S1", "--semester", "99", "--format", "json")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        data = json.loads(stdout)
+        self.assertTrue(data["student_exists"])
+        self.assertFalse(data["semester_found"])
+        self.assertEqual(data["semesters"], [])
+        self.assertEqual(data["cgpa"]["gpa"], 10.0)
+
+    def test_explain_json_mode_malformed_csv_exits_two(self):
+        import json
+        self.write_csv(["S1,Mathematics,invalid_score,100,2025-01-15,3,1\n"])
+        code, stdout, stderr = self.run_explain("S1", "--format", "json")
+        self.assertEqual(code, 2)
+        data = json.loads(stdout)
+        self.assertEqual(data["command"], "explain")
+        self.assertIn("error", data)
+
+
 if __name__ == "__main__":
     unittest.main()

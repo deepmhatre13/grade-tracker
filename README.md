@@ -20,14 +20,12 @@ On Windows, use `python` instead of `python3`.
 |---|---|
 | `list [--format json]` | Every mark, with its letter grade; `--format json` emits a JSON document |
 | `summary <student_id> [--format json]` | One student's marks and GPA; `--format json` emits a JSON document |
+| `explain <student_id> [--semester N] [--format json]` | Explains how assessment marks contribute to a student's SGPA and CGPA; `--format json` emits a JSON document |
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester>` | Adds a mark |
 | `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
 | `export [--output path]` | Writes an HTML report, `reports/index.html` by default |
-
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
-
-| `validate` | Audits the CSV for malformed or invalid records, without changing the file |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
 
@@ -66,13 +64,44 @@ The whole update runs as one transaction: the command takes the same cross-proce
 - The report has a card for every student in the CSV, and only those.
 - Everything in the report is shown as plain text. A subject name containing HTML is displayed, not run.
 
+## Explaining GPA Calculations
+
+The `explain` command breaks down how each individual assessment contributes to a student's SGPA (Semester Grade Point Average) and CGPA (Cumulative Grade Point Average). It exposes the authoritative calculation layer's intermediate inputs, weighted contributions, deduplication inclusion decisions, and aggregate numerators and denominators.
+
+```bash
+python3 -m grade_tracker explain CS101
+python3 -m grade_tracker explain CS101 --semester 2
+python3 -m grade_tracker explain CS101 --format json
+```
+
+### Assessment Fields
+- **Subject**: Course or subject name.
+- **Score / Max**: Score earned and maximum possible score.
+- **Pct**: Calculated percentage (`Decimal(score) / Decimal(max_score) * 100`).
+- **Grade**: Letter grade assigned (`A`: >=90%, `B`: >=80%, `C`: >=70%, `D`: >=60%, `F`: <60%).
+- **Pts**: Grade point value (`A`=10.0, `B`=9.0, `C`=8.0, `D`=7.0, `F`=0.0).
+- **Cr**: Credit weight assigned to the assessment (defaults to 3.0 on legacy rows).
+- **W.Pts**: Weighted contribution to the GPA numerator (`Pts * Cr`).
+- **Status**: Record inclusion status (`Included` or `Excluded (<reason>)`).
+
+### Calculation Semantics and Rules
+- **Assessment Identity & Deduplication**: Distinct assessments are identified by `(student_id, semester, subject.casefold(), date)`. Two different subjects on the same date are distinct assessments. A repeat of the same assessment identity in the same semester is excluded as a duplicate, and only the first occurrence is counted. Legitimate retakes in different semesters have distinct identities and are both counted.
+- **SGPA & CGPA Aggregates**:
+  - Numerator: Sum of `Pts * Cr` across all included records.
+  - Denominator: Sum of `Cr` across all included records.
+  - Result: `round(Numerator / Denominator, 2)`. If Denominator is 0.0, GPA is 0.00. If no valid records exist, GPA is reported as unavailable.
+- **Semester Filtering**: When `--semester <sem>` is provided, only the assessments and SGPA for that semester are displayed, but the overall CGPA continues to be computed across all of the student's records across all semesters.
+- **Missing Students vs Missing Semesters**: A student not present in the CSV is reported as not found (`No records found for student '<id>.'`). A student who exists but has no records for the filtered semester is clearly distinguished (`No records found for student '<id>' in semester <sem>.`).
+- **Read-Only**: The command never modifies or rewrites the underlying CSV.
+
 ## Machine-readable JSON output
 
-The read-only commands `list`, `summary`, `average`, and `validate` accept `--format json`. The default remains the existing human-readable text, so existing commands are unchanged. In JSON mode, stdout contains exactly one valid JSON document and nothing else; diagnostics and argparse errors go to stderr. Values that are not available are JSON `null`, not `"None"`, `"N/A"`, or similar strings. JSON output uses stable snake_case field names, arrays for collections, and JSON numbers for scores and averages.
+The read-only commands `list`, `summary`, `explain`, `average`, and `validate` accept `--format json`. The default remains the existing human-readable text, so existing commands are unchanged. In JSON mode, stdout contains exactly one valid JSON document and nothing else; diagnostics and argparse errors go to stderr. Values that are not available are JSON `null`, not `"None"`, `"N/A"`, or similar strings. JSON output uses stable snake_case field names, arrays for collections, and JSON numbers for scores and averages.
 
 ```bash
 python3 -m grade_tracker list --format json
 python3 -m grade_tracker summary CS101 --format json
+python3 -m grade_tracker explain CS101 --format json
 python3 -m grade_tracker average Mathematics --format json
 python3 -m grade_tracker validate --format json
 ```
@@ -95,6 +124,14 @@ The `file` and `subject` or `student_id` values echo the CLI input exactly; reco
 
 `grades` contains every record for the student. `semesters` is ordered by semester and each item contains its `sgpa` and matching records. If the student has no records, `count` is 0, `cgpa` is `null`, and both arrays are empty.
 
+### `explain` schema
+
+```json
+{"cgpa":{"denominator":19.0,"gpa":9.47,"numerator":180.0},"command":"explain","semester":null,"semester_found":true,"semesters":[{"denominator":12.0,"numerator":114.0,"records":[{"credits":3.0,"date":"2025-01-15","exclusion_reason":null,"grade_points":10.0,"included":true,"letter_grade":"A","max_score":100.0,"percentage":95.0,"score":95.0,"semester":"1","student_id":"CS101","subject":"Mathematics","weighted_points":30.0}],"semester":"1","sgpa":9.5}],"student_exists":true,"student_id":"CS101"}
+```
+
+`student_exists` and `semester_found` boolean flags clearly differentiate missing students and absent semesters. `cgpa` exposes the overall cumulative numerator, denominator, and GPA across all student records. `semesters` contains semester-by-semester SGPA calculations and per-assessment records with `included` and `exclusion_reason`.
+
 ### `average` schema
 
 ```json
@@ -113,9 +150,9 @@ The `file` and `subject` or `student_id` values echo the CLI input exactly; reco
 
 ### JSON exit codes and failures
 
-Successful `list`, `summary`, and `average` JSON commands exit 0, including empty result sets. `validate` exits 0 when valid and 1 when it finds one or more problems. Invalid `--format` values follow argparse's normal behavior: exit 2 with a usage error on stderr and no stdout.
+Successful `list`, `summary`, `explain`, and `average` JSON commands exit 0, including empty result sets. `validate` exits 0 when valid and 1 when it finds one or more problems. Invalid `--format` values follow argparse's normal behavior: exit 2 with a usage error on stderr and no stdout.
 
-Malformed CSV input is never converted into a successful empty JSON result for `list`, `summary`, or `average`. They emit a predictable JSON error document with `error.code` equal to `"input_error"` and exit 2; the error message identifies the row or structural problem and suggests running `validate`. A missing data file follows the existing loader contract and is represented as an empty dataset by those three commands; use `validate --format json` to distinguish that case, since validate reports a missing file and exits 1.
+Malformed CSV input is never converted into a successful empty JSON result for `list`, `summary`, `explain`, or `average`. They emit a predictable JSON error document with `error.code` equal to `"input_error"` and exit 2; the error message identifies the row or structural problem and suggests running `validate`. A missing data file follows the existing loader contract and is represented as an empty dataset by those commands; use `validate --format json` to distinguish that case, since validate reports a missing file and exits 1.
 
 ## Code
 
