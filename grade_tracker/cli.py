@@ -1465,8 +1465,8 @@ def cmd_explain(args):
     grades = load_grades(args.data)
     student_records = [g for g in grades if g.get("student_id") == args.student_id]
     if not student_records:
-        print(f"No records found for student '{args.student_id}'.")
-        return
+        print(f"Error: student '{args.student_id}' does not exist.", file=sys.stderr)
+        raise SystemExit(1)
 
     explanation = explain_student_gpa(grades, args.student_id, semester=requested_sem)
     if requested_sem is not None and not explanation["semester_found"]:

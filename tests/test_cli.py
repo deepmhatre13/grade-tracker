@@ -857,9 +857,30 @@ class TestCmdExplain(unittest.TestCase):
     def test_explain_missing_student(self):
         self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
         code, stdout, stderr = self.run_explain("UNKNOWN")
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-        self.assertIn("No records found for student 'UNKNOWN'.", stdout)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Error: student 'UNKNOWN' does not exist.", stderr)
+
+    def test_explain_missing_student_subprocess(self):
+        import subprocess
+        self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "grade_tracker",
+                "--data",
+                str(self.data_path),
+                "explain",
+                "UNKNOWN",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Error: student 'UNKNOWN' does not exist.", result.stderr)
 
     def test_explain_student_with_nonexistent_semester(self):
         self.write_csv(["S1,Mathematics,95,100,2025-01-15,3,1\n"])
