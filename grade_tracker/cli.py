@@ -29,7 +29,8 @@ from grade_tracker.export import build_html
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "grades.csv"
 BACKUP_FORMAT_VERSION = "1.0"
-SUPPORTED_CSV_SCHEMA_VERSION = "1.0"
+CURRENT_CSV_SCHEMA_VERSION = "1.0"
+SUPPORTED_CSV_SCHEMA_VERSION = CURRENT_CSV_SCHEMA_VERSION
 CANONICAL_COLUMNS = [
     "student_id",
     "subject",
@@ -39,6 +40,182 @@ CANONICAL_COLUMNS = [
     "credits",
     "semester",
 ]
+
+# Legacy schema column definitions
+LEGACY_SCHEMA_COLUMNS = {
+    "0.1": ["student_id", "subject", "score", "max_score", "date"],
+    "0.2": ["student_id", "subject", "score", "max_score", "date", "semester"],
+    "0.3": ["student_id", "subject", "score", "max_score", "date", "credits"],
+    "1.0": CANONICAL_COLUMNS,
+}
+
+SCHEMA_MIGRATION_REGISTRY = {}
+
+
+def register_migration(from_version, to_version, description=None):
+    """Decorator to register a migration step between two schema versions."""
+    def decorator(fn):
+        SCHEMA_MIGRATION_REGISTRY[(from_version, to_version)] = {
+            "func": fn,
+            "description": description or fn.__doc__ or f"Migrate from {from_version} to {to_version}",
+        }
+        return fn
+    return decorator
+
+
+def _migrate_row_0_1_to_1_0(row, header):
+    """Migrate row from schema 0.1 (5 columns) to 1.0 (7 columns)."""
+    idx = {name: i for i, name in enumerate(header)}
+    return [
+        row[idx["student_id"]],
+        row[idx["subject"]],
+        row[idx["score"]],
+        row[idx["max_score"]],
+        row[idx["date"]],
+        "3.0",  # default credits
+        "1",    # default semester
+    ]
+
+
+def _migrate_row_0_2_to_1_0(row, header):
+    """Migrate row from schema 0.2 (missing credits) to 1.0."""
+    idx = {name: i for i, name in enumerate(header)}
+    sem_val = row[idx["semester"]] if "semester" in idx and idx["semester"] < len(row) else "1"
+    if not sem_val or not str(sem_val).strip():
+        sem_val = "1"
+    return [
+        row[idx["student_id"]],
+        row[idx["subject"]],
+        row[idx["score"]],
+        row[idx["max_score"]],
+        row[idx["date"]],
+        "3.0",  # default credits
+        sem_val,
+    ]
+
+
+def _migrate_row_0_3_to_1_0(row, header):
+    """Migrate row from schema 0.3 (missing semester) to 1.0."""
+    idx = {name: i for i, name in enumerate(header)}
+    credits_val = row[idx["credits"]] if "credits" in idx and idx["credits"] < len(row) else "3.0"
+    if not credits_val or not str(credits_val).strip():
+        credits_val = "3.0"
+    return [
+        row[idx["student_id"]],
+        row[idx["subject"]],
+        row[idx["score"]],
+        row[idx["max_score"]],
+        row[idx["date"]],
+        credits_val,
+        "1",    # default semester
+    ]
+
+
+register_migration(
+    "0.1", "1.0",
+    description="Add optional 'credits' (default: 3.0) and 'semester' (default: '1') columns",
+)(_migrate_row_0_1_to_1_0)
+
+register_migration(
+    "0.2", "1.0",
+    description="Add optional 'credits' (default: 3.0) column",
+)(_migrate_row_0_2_to_1_0)
+
+register_migration(
+    "0.3", "1.0",
+    description="Add optional 'semester' (default: '1') column",
+)(_migrate_row_0_3_to_1_0)
+
+
+def detect_csv_schema_version(header):
+    """Detect the CSV schema version from the normalized header list.
+
+    Returns:
+        tuple[str, str]: (version, detection_method)
+    Raises:
+        ValueError: If header is empty, duplicate, or unrecognized.
+    """
+    if not header:
+        raise ValueError("file is empty (no CSV header)")
+
+    normalized_header = [
+        col.lstrip("\ufeff").strip() if col else col for col in header
+    ]
+    if not any(normalized_header):
+        raise ValueError("CSV header is blank; expected a valid grades schema")
+
+    duplicate_cols = sorted({col for col in normalized_header if normalized_header.count(col) > 1})
+    if duplicate_cols:
+        raise ValueError(f"duplicate header column(s): {', '.join(duplicate_cols)}")
+
+    # Check for exact matches with known schemas
+    for ver, cols in LEGACY_SCHEMA_COLUMNS.items():
+        if normalized_header == cols:
+            method = "canonical header" if ver == CURRENT_CSV_SCHEMA_VERSION else "legacy header"
+            return ver, method
+
+    # Check if header contains unexpected columns
+    canonical_set = set(CANONICAL_COLUMNS)
+    unexpected = [col for col in normalized_header if col not in canonical_set]
+    if unexpected:
+        raise ValueError(f"unrecognized header: unexpected column(s) {', '.join(repr(c) for c in unexpected)}")
+
+    required = ["student_id", "subject", "score", "max_score", "date"]
+    missing = [col for col in required if col not in normalized_header]
+    if missing:
+        raise ValueError(f"unrecognized header: missing required column(s) {', '.join(missing)}")
+
+    # If all required are present but ordering differs from known schemas, or unknown permutation
+    raise ValueError(f"unrecognized header layout or ordering: {header!r}")
+
+
+def get_migration_plan(from_version, to_version=CURRENT_CSV_SCHEMA_VERSION):
+    """Get the sequence of migration steps from from_version to to_version.
+
+    Returns:
+        list[dict]: List of migration step dicts with keys 'from', 'to', 'func', 'description'.
+    Raises:
+        ValueError: If no migration path exists.
+    """
+    if from_version == to_version:
+        return []
+
+    # Direct migration
+    if (from_version, to_version) in SCHEMA_MIGRATION_REGISTRY:
+        step = SCHEMA_MIGRATION_REGISTRY[(from_version, to_version)]
+        return [{
+            "from": from_version,
+            "to": to_version,
+            "func": step["func"],
+            "description": step["description"],
+        }]
+
+    # Breadth-first search for multi-step migrations
+    queue = [[(from_version, None, None)]]
+    visited = {from_version}
+    while queue:
+        path = queue.pop(0)
+        curr = path[-1][0]
+        if curr == to_version:
+            steps = []
+            for i in range(1, len(path)):
+                prev_v = path[i - 1][0]
+                next_v = path[i][0]
+                step = SCHEMA_MIGRATION_REGISTRY[(prev_v, next_v)]
+                steps.append({
+                    "from": prev_v,
+                    "to": next_v,
+                    "func": step["func"],
+                    "description": step["description"],
+                })
+            return steps
+
+        for (src, dst), info in SCHEMA_MIGRATION_REGISTRY.items():
+            if src == curr and dst not in visited:
+                visited.add(dst)
+                queue.append(path + [(dst, info["func"], info["description"])])
+
+    raise ValueError(f"no migration path from schema version {from_version!r} to {to_version!r}")
 
 # Output modes for read-only commands.  "human" preserves the original text
 # output; "json" emits one JSON document on stdout and sends diagnostics to
@@ -1986,6 +2163,193 @@ def cmd_restore(args):
     raise SystemExit(0)
 
 
+def migrate_grades(csv_path=DEFAULT_DATA_PATH, dry_run=False):
+    """Migrate grades CSV to the current canonical schema under an inter-process lock.
+
+    Returns:
+        dict:
+            - "path": Path to data file
+            - "from_version": detected schema version
+            - "to_version": target schema version
+            - "method": detection method description
+            - "records": total data records processed
+            - "steps": list of applied/planned migration steps
+            - "dry_run": boolean
+            - "already_current": boolean whether file was already at current version
+
+    Raises:
+        FileNotFoundError: If the CSV file does not exist.
+        ValueError: If file is empty, malformed, invalid, or has an unknown schema.
+    """
+    path = Path(csv_path).resolve()
+    lock_file = _lock_path_for(path)
+
+    with _InterProcessLock(lock_file):
+        if not path.exists():
+            raise FileNotFoundError(f"data file does not exist: {path}")
+        if not path.is_file():
+            raise ValueError(f"data path is not a regular file: {path}")
+
+        try:
+            if path.stat().st_size == 0:
+                raise ValueError(f"file is empty (no CSV header or records): {path}")
+        except OSError as exc:
+            raise ValueError(f"cannot read file ({exc}): {path}") from exc
+
+        # Read header and raw rows
+        try:
+            with open(path, mode="r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    raise ValueError(f"file is empty (no CSV header or records): {path}")
+                raw_rows = list(reader)
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"file is not valid UTF-8 text ({exc}): {path}") from exc
+        except csv.Error as exc:
+            raise ValueError(f"malformed CSV ({exc}): {path}") from exc
+
+        # Detect schema version
+        from_ver, method = detect_csv_schema_version(header)
+        to_ver = CURRENT_CSV_SCHEMA_VERSION
+
+        plan = get_migration_plan(from_ver, to_ver)
+
+        # Audit file integrity using audit_grades_csv
+        # Legacy formats that omit credits/semester are accepted by audit_grades_csv.
+        diagnostics = audit_grades_csv(path)
+        if diagnostics:
+            raise ValueError(
+                f"cannot migrate invalid CSV ({len(diagnostics)} validation problems found):\n"
+                + "\n".join(f"  {d}" for d in diagnostics)
+            )
+
+        if from_ver == to_ver:
+            return {
+                "path": path,
+                "from_version": from_ver,
+                "to_version": to_ver,
+                "method": method,
+                "records": len(raw_rows),
+                "steps": [],
+                "dry_run": dry_run,
+                "already_current": True,
+            }
+
+        if dry_run:
+            return {
+                "path": path,
+                "from_version": from_ver,
+                "to_version": to_ver,
+                "method": method,
+                "records": len(raw_rows),
+                "steps": [s["description"] for s in plan],
+                "dry_run": True,
+                "already_current": False,
+            }
+
+        # Apply migration steps sequentially
+        current_header = list(header)
+        current_rows = list(raw_rows)
+
+        for step in plan:
+            migrated_rows = []
+            for row in current_rows:
+                if not row:
+                    continue
+                migrated_rows.append(step["func"](row, current_header))
+            current_rows = migrated_rows
+            current_header = list(CANONICAL_COLUMNS)
+
+        # Write to temporary file, flush, fsync, validate, and atomically replace
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".grades-migrate-", suffix=".tmp"
+        )
+        try:
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(CANONICAL_COLUMNS)
+                    for row in current_rows:
+                        writer.writerow(row)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Validate the prepared temporary file against canonical schema before replacement
+                tmp_diagnostics = audit_grades_csv(tmp_name)
+                if tmp_diagnostics:
+                    raise ValueError(
+                        f"migrated CSV failed post-migration validation ({len(tmp_diagnostics)} problems found):\n"
+                        + "\n".join(f"  {d}" for d in tmp_diagnostics)
+                    )
+
+                os.replace(tmp_name, path)
+                tmp_name = None
+            except OSError as exc:
+                raise ValueError(f"failed to write {path}: {exc}") from exc
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+        return {
+            "path": path,
+            "from_version": from_ver,
+            "to_version": to_ver,
+            "method": method,
+            "records": len(current_rows),
+            "steps": [s["description"] for s in plan],
+            "dry_run": False,
+            "already_current": False,
+        }
+
+
+def cmd_migrate(args):
+    """Migrate the grade data file to the current canonical CSV schema."""
+    try:
+        result = migrate_grades(csv_path=args.data, dry_run=args.dry_run)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    if result["already_current"]:
+        print(
+            f"File is already at the current schema version ({result['from_version']}). "
+            "No migration needed."
+        )
+        raise SystemExit(0)
+
+    noun = "record" if result["records"] == 1 else "records"
+    if result["dry_run"]:
+        print(
+            f"Dry run: Migration preview for {result['path']}:\n"
+            f"  Detected schema version: {result['from_version']} (via {result['method']})\n"
+            f"  Target schema version: {result['to_version']}\n"
+            f"  Records to process: {result['records']} {noun}\n"
+            f"  Planned steps:"
+        )
+        for i, step in enumerate(result["steps"], start=1):
+            print(f"    {i}. {step}")
+        print("  Status: no changes were made (dry run).")
+        raise SystemExit(0)
+
+    print(
+        f"Migration completed successfully for {result['path']}:\n"
+        f"  From schema version: {result['from_version']} (via {result['method']})\n"
+        f"  To schema version: {result['to_version']}\n"
+        f"  Records migrated: {result['records']} {noun}\n"
+        f"  Completed steps:"
+    )
+    for i, step in enumerate(result["steps"], start=1):
+        print(f"    {i}. {step}")
+    print("  Status: verified")
+    raise SystemExit(0)
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
@@ -2125,6 +2489,24 @@ def main():
     )
     p_restore.add_argument("backup_path", help="Path to backup CSV or JSON manifest")
     p_restore.set_defaults(func=cmd_restore)
+
+    # migrate
+    p_migrate = subparsers.add_parser(
+        "migrate",
+        help="Migrate a legacy grades CSV to the current canonical schema",
+        description=(
+            "Migrate a legacy grades CSV to the current canonical schema version. "
+            "Runs under an inter-process lock with full data validation and atomic replacement. "
+            "Use --dry-run to preview planned migration steps without modifying the file."
+        ),
+    )
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview migration steps and records without modifying the file",
+    )
+    p_migrate.set_defaults(func=cmd_migrate)
 
     args = parser.parse_args()
     if not args.command:

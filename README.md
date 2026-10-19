@@ -28,6 +28,7 @@ On Windows, use `python` instead of `python3`.
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
+| `migrate [--dry-run]` | Migrates legacy CSV schemas (0.1, 0.2, 0.3) to canonical 1.0 schema under inter-process lock |
 
 
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
@@ -62,6 +63,54 @@ repeated rows are still rejected and counted only once.
 - Temporary files are cleaned up on any failure, leaving the original destination byte-for-byte unchanged.
 - If the destination does not yet exist, its directory structure is created and the file is safely established.
 - Concurrency & atomicity limitations: Advisory locks protect coordinating processes using this CLI. Durability is bounded by the underlying OS filesystem guarantees.
+
+## Versioned CSV Schema Migrations
+
+The `migrate` command upgrades older CSV schema formats to the current canonical schema (`1.0`) while preserving all existing data and legacy default semantics.
+
+```bash
+python3 -m grade_tracker migrate --dry-run
+python3 -m grade_tracker migrate
+python3 -m grade_tracker --data path/to/custom_grades.csv migrate
+```
+
+### Schema Versions
+
+The migration framework recognizes the following schema layouts based on header structure:
+- **`0.1` (5 columns)**: `student_id,subject,score,max_score,date` (legacy schema omitting both `credits` and `semester`).
+- **`0.2` (6 columns)**: `student_id,subject,score,max_score,date,semester` (legacy schema omitting `credits`).
+- **`0.3` (6 columns)**: `student_id,subject,score,max_score,date,credits` (legacy schema omitting `semester`).
+- **`1.0` (7 columns, canonical)**: `student_id,subject,score,max_score,date,credits,semester`.
+
+### Migration Semantics & Defaults
+
+- When migrating from `0.1`, missing `credits` defaults to `3.0` and missing `semester` defaults to `"1"`.
+- When migrating from `0.2`, missing `credits` defaults to `3.0` while existing `semester` values are preserved.
+- When migrating from `0.3`, missing `semester` defaults to `"1"` while existing `credits` values are preserved.
+- UTF-8 byte-order marks (`\ufeff`) are automatically normalized.
+- Existing populated values, custom credits, custom semesters, and exact record ordering are fully preserved.
+
+### Transactionality & Safety Guarantees
+
+- **Inter-process locking**: All migrations coordinate under the advisory lock (`_InterProcessLock`), ensuring serial execution and preventing race conditions or lost updates with concurrent grade writes.
+- **Pre-migration audit**: The source file is thoroughly audited (`audit_grades_csv`) before migration begins. If any record is malformed or invalid, migration aborts with exit code 1 and leaves the source file completely untouched.
+- **Atomic replacement**: Migrated records are written to a temporary file (`.tmp`) in the same directory, flushed, and atomically replaced (`os.replace`).
+- **Failure atomicity**: On any failure (write error, disk full, invalid record), temporary files are cleaned up and the original file remains byte-for-byte unchanged.
+- **Idempotent**: Running `migrate` on a file already at schema `1.0` is a safe no-op that reports the file is already up to date.
+- **`--dry-run`**: Previews the migration plan, detected schema, record count, and changes without modifying the file or creating temporary files.
+
+### Extensibility
+
+The framework uses an explicit registry `SCHEMA_MIGRATION_REGISTRY` and decorator `@register_migration(from_ver, to_ver)`:
+
+```python
+from grade_tracker.cli import register_migration
+
+@register_migration("1.0", "2.0", description="Add course status column")
+def migrate_1_0_to_2_0(row, header):
+    return row + ["completed"]
+```
+Multi-hop migrations (e.g. `0.1` -> `1.0` -> `2.0`) are resolved automatically via bread-first search migration planning.
 
 ## How it's supposed to work
 
