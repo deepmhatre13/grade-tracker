@@ -725,6 +725,153 @@ def edit_grade(
             raise ValueError(f"failed to write {path}: {exc}") from exc
 
 
+def delete_grades(
+    csv_path=DEFAULT_DATA_PATH,
+    student_id=None,
+    semester=None,
+    subject=None,
+    date=None,
+    dry_run=False,
+    confirmed=False,
+):
+    """Delete grade records matching selectors as a single locked transaction.
+
+    At least one selector must be non-None. Selectors combine with AND logic:
+    - student_id: exact match against stripped student ID
+    - semester: exact match against stripped semester string
+    - subject: case-insensitive match (matching subject_average and assessment_key)
+    - date: exact match against YYYY-MM-DD date string (validated format)
+
+    Raises:
+        ValueError: If selectors are missing/invalid, CSV fails audit/schema,
+            confirmation is missing for non-dry-run, or I/O fails.
+    Returns:
+        tuple[int, list[dict]]: (match_count, matching_records)
+    """
+    # 1. Validate selectors
+    selectors = {
+        "student_id": student_id,
+        "semester": semester,
+        "subject": subject,
+        "date": date,
+    }
+    if all(v is None for v in selectors.values()):
+        raise ValueError(
+            "at least one selector is required; pass at least one of "
+            "--student-id, --semester, --subject, --date"
+        )
+
+    norm_student_id = student_id.strip() if student_id is not None else None
+    if norm_student_id == "":
+        raise ValueError("student_id selector cannot be empty or blank")
+
+    norm_semester = str(semester).strip() if semester is not None else None
+    if norm_semester == "":
+        raise ValueError("semester selector cannot be empty or blank")
+
+    norm_subject = subject.strip() if subject is not None else None
+    if norm_subject == "":
+        raise ValueError("subject selector cannot be empty or blank")
+
+    norm_date = date.strip() if date is not None else None
+    if norm_date is not None:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", norm_date):
+            raise ValueError("date selector must use YYYY-MM-DD format")
+        try:
+            from datetime import date as _dt_date
+            _dt_date.fromisoformat(norm_date)
+        except ValueError as exc:
+            raise ValueError(
+                "date selector must be a valid calendar date in YYYY-MM-DD format"
+            ) from exc
+
+    if not dry_run and not confirmed:
+        raise ValueError(
+            "deletion requires confirmation; pass --yes to confirm deletion, "
+            "or --dry-run to preview"
+        )
+
+    path = Path(csv_path)
+    lock_file = _lock_path_for(path)
+
+    with _InterProcessLock(lock_file):
+        if not path.exists():
+            return 0, []
+
+        diagnostics = audit_grades_csv(path)
+        if diagnostics:
+            raise ValueError(
+                f"grades file failed validation ({len(diagnostics)} problems found); "
+                "repair it with 'validate' before deleting"
+            )
+
+        file_exists, raw_rows = _read_existing_rows(path)
+        if not file_exists or not raw_rows:
+            return 0, []
+
+        header = [
+            "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+        ]
+        index_of = {name: pos for pos, name in enumerate(header)}
+
+        def cell(row, name):
+            pos = index_of[name]
+            return row[pos] if pos < len(row) else None
+
+        def matches_selectors(row):
+            if not _row_has_visible_content(row):
+                return False
+            row_student = (cell(row, "student_id") or "").strip()
+            row_semester = (cell(row, "semester") or "").strip()
+            row_subject = (cell(row, "subject") or "").strip()
+            row_date = (cell(row, "date") or "").strip()
+
+            if norm_student_id is not None and row_student != norm_student_id:
+                return False
+            if norm_semester is not None and row_semester != norm_semester:
+                return False
+            if norm_subject is not None and row_subject.casefold() != norm_subject.casefold():
+                return False
+            if norm_date is not None and row_date != norm_date:
+                return False
+            return True
+
+        matching_rows = []
+        remaining_rows = []
+        matching_dicts = []
+
+        for row in raw_rows:
+            if matches_selectors(row):
+                matching_rows.append(row)
+                matching_dicts.append({
+                    "student_id": (cell(row, "student_id") or "").strip(),
+                    "subject": (cell(row, "subject") or "").strip(),
+                    "score": cell(row, "score"),
+                    "max_score": cell(row, "max_score"),
+                    "date": cell(row, "date"),
+                    "credits": cell(row, "credits"),
+                    "semester": cell(row, "semester"),
+                })
+            else:
+                remaining_rows.append(row)
+
+        match_count = len(matching_rows)
+
+        if dry_run or match_count == 0:
+            return match_count, matching_dicts
+
+        # Destructive execution with matches
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _atomic_write_rows(path, remaining_rows)
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError(f"failed to write {path}: {exc}") from exc
+
+        return match_count, matching_dicts
+
+
 def _row_has_visible_content(row):
     """True when a parsed CSV record contains at least one non-blank cell."""
     return any(cell.strip() for cell in row)
@@ -1667,6 +1814,42 @@ def cmd_edit(args):
     )
 
 
+def cmd_delete(args):
+    """Delete grade records matching selectors."""
+    try:
+        count, records = delete_grades(
+            csv_path=args.data,
+            student_id=args.student_id,
+            semester=args.semester,
+            subject=args.subject,
+            date=args.date,
+            dry_run=args.dry_run,
+            confirmed=args.yes,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    noun = "record" if count == 1 else "records"
+    if args.dry_run:
+        if count == 0:
+            print("Dry run: 0 records match the criteria. No changes were made.")
+        else:
+            print(f"Dry run: {count} {noun} would be deleted (no changes were made):")
+            for r in records:
+                score_str = f"{float(r['score']):.1f}/{float(r['max_score']):.1f}"
+                date_str = r['date'] or "-"
+                print(
+                    f"  {r['student_id']:<10} {r['subject']:<18} "
+                    f"Sem: {r['semester']:<4} Date: {date_str:<12} Score: {score_str}"
+                )
+    else:
+        if count == 0:
+            print("0 records matched the criteria. No changes were made.")
+        else:
+            print(f"Successfully deleted {count} {noun}.")
+
+
 
 def _add_format_argument(parser):
     """Add the shared ``--format`` option to a read-only command parser."""
@@ -2104,6 +2287,44 @@ def main():
         help="New date, YYYY-MM-DD (omit to keep the current value)",
     )
     p_edit.set_defaults(func=cmd_edit)
+
+    # delete
+    p_delete = subparsers.add_parser(
+        "delete",
+        help="Delete grade records matching selectors",
+        description=(
+            "Delete grade records matching selectors as a single transaction under "
+            "an inter-process lock. At least one selector (--student-id, --semester, "
+            "--subject, --date) is required. Selectors combine with AND logic. "
+            "Use --dry-run to preview matching records without modifying the file. "
+            "Destructive deletion requires explicit confirmation via --yes."
+        ),
+    )
+    p_delete.add_argument(
+        "--student-id", dest="student_id", default=None,
+        help="Filter records to delete by student ID",
+    )
+    p_delete.add_argument(
+        "--semester", dest="semester", default=None,
+        help="Filter records to delete by semester",
+    )
+    p_delete.add_argument(
+        "--subject", dest="subject", default=None,
+        help="Filter records to delete by subject (case-insensitive)",
+    )
+    p_delete.add_argument(
+        "--date", dest="date", default=None,
+        help="Filter records to delete by date (YYYY-MM-DD)",
+    )
+    p_delete.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Preview records that would be deleted without modifying the file",
+    )
+    p_delete.add_argument(
+        "--yes", "-y", action="store_true", default=False,
+        help="Confirm deletion of matching records",
+    )
+    p_delete.set_defaults(func=cmd_delete)
 
 
     # validate

@@ -24,10 +24,22 @@ On Windows, use `python` instead of `python3`.
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester> [--allow-duplicate]` | Adds a mark; opt in when recording a separate same-day assessment |
 | `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
+| `delete [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD] [--dry-run] [--yes]` | Bulk deletes matching grade records under inter-process lock; requires confirmation or dry-run |
 | `export [--output path]` | Writes an HTML report, `reports/index.html` by default |
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
+
+
+`delete` performs transactional bulk deletion of grade records matching explicit selection criteria:
+- **Selectors**: Pass at least one of `--student-id`, `--semester`, `--subject`, or `--date`. Requests with no selectors are rejected to prevent accidental deletion of all records.
+- **AND Semantics**: When multiple selectors are provided, only records satisfying *all* selectors are matched.
+- **Normalization & Matching**: Student ID and semester match exactly (stripped). Subject matching is case-insensitive. Date matching requires valid `YYYY-MM-DD` calendar dates.
+- **Dry-run Preview (`--dry-run`)**: Previews matching records without modifying the CSV. The destination file remains byte-for-byte untouched and no temporary files are created.
+- **Confirmation Requirement (`--yes` / `-y`)**: Destructive deletion requires explicit confirmation via `--yes`. If omitted, the command aborts with exit code 2 and leaves the file untouched.
+- **Zero Matches**: When no records match, the command reports 0 matches and exits cleanly without rewriting or modifying the file.
+- **Transactionality & Concurrency**: Deletion coordinates under the destination CSV's advisory inter-process lock (`_InterProcessLock`). The file is audited for integrity (`audit_grades_csv`), read, and filtered under lock. Remaining records are written to a temporary file in the destination directory, flushed and `fsync`ed, and atomically replaced (`os.replace`). Order and contents of non-deleted records are strictly preserved.
+- **Exit Codes & Errors**: Exits 0 on successful deletion, dry run, or 0 matches. Exits 2 on invalid selectors, missing confirmation, corrupt CSV data, or I/O errors with diagnostics printed to `stderr`.
 
 
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
