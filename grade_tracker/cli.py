@@ -46,6 +46,77 @@ CANONICAL_COLUMNS = [
 HUMAN_FORMAT = "human"
 JSON_FORMAT = "json"
 
+REVISION_TOKEN_PREFIX = "sha256:"
+_REVISION_TOKEN_REGEX = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_revision_token(token):
+    """Validate format of an expected-revision token.
+
+    Format must be 'sha256:<64-lowercase-hex-digits>'.
+    Raises ValueError if malformed.
+    """
+    if not isinstance(token, str) or not _REVISION_TOKEN_REGEX.fullmatch(token):
+        raise ValueError(
+            f"invalid revision token format: {token!r}; expected 'sha256:<64-hex-digits>'"
+        )
+
+
+def compute_record_revision_token(record):
+    """Compute deterministic revision token from canonical persisted grade record.
+
+    Uses SHA-256 over canonical JSON serialization of canonical columns in order:
+    ['student_id', 'subject', 'score', 'max_score', 'date', 'credits', 'semester'].
+
+    Values are normalized according to existing data model:
+    - student_id: stripped string
+    - subject: stripped string
+    - score: float formatted to shortest round-trip or float
+    - max_score: float
+    - date: stripped string
+    - credits: float
+    - semester: stripped string
+
+    Returns string formatted as 'sha256:<64-lowercase-hex-digits>'.
+    """
+    # Canonical field values
+    student_id = str(record.get("student_id") or "").strip()
+    subject = str(record.get("subject") or "").strip()
+    try:
+        score_val = float(record["score"])
+    except (KeyError, TypeError, ValueError):
+        score_val = 0.0
+    try:
+        max_score_val = float(record["max_score"])
+    except (KeyError, TypeError, ValueError):
+        max_score_val = 0.0
+    date_val = str(record.get("date") or "").strip()
+    try:
+        credits_val = float(record.get("credits", 3.0))
+    except (TypeError, ValueError):
+        credits_val = 3.0
+    semester_val = str(record.get("semester", "1") if record.get("semester") is not None else "1").strip()
+
+    canonical_payload = {
+        "student_id": student_id,
+        "subject": subject,
+        "score": score_val,
+        "max_score": max_score_val,
+        "date": date_val,
+        "credits": credits_val,
+        "semester": semester_val,
+    }
+
+    serialized = json.dumps(
+        canonical_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    digest = hashlib.sha256(serialized).hexdigest().lower()
+    return f"{REVISION_TOKEN_PREFIX}{digest}"
+
 
 
 
@@ -149,10 +220,10 @@ def _load_grades_for_json(csv_path, command):
     return grades
 
 
-def _grade_json_record(grade, semester=None):
+def _grade_json_record(grade, semester=None, include_revision_token=False):
     """Serialize one loaded grade record with stable field names and types."""
     semester_value = grade["semester"] if semester is None else semester
-    return {
+    record = {
         "student_id": grade["student_id"],
         "subject": grade["subject"],
         "score": grade["score"],
@@ -167,6 +238,12 @@ def _grade_json_record(grade, semester=None):
         if grade["max_score"] > 0
         else None,
     }
+    if include_revision_token:
+        record_for_token = dict(grade)
+        if semester is not None:
+            record_for_token["semester"] = semester_value
+        record["revision_token"] = compute_record_revision_token(record_for_token)
+    return record
 
 
 def _lock_path_for(csv_path):
@@ -567,26 +644,29 @@ def edit_grade(
     new_semester=None,
     new_subject=None,
     new_date=None,
+    expected_revision=None,
 ):
     """Edit one existing grade row in ``csv_path`` as a single transaction.
 
     The target record is identified by its current assessment identity
     ``(student_id, semester, subject, date)``.  Any change option left as
     ``None`` keeps the record's existing value — omitted options are never
-    replaced with defaults.
+    replaced with defaults.  When ``expected_revision`` is provided, the edit
+    is rejected if the target record's current revision token does not match.
 
     The whole update runs as one locked transaction:
 
     1. Acquire the cross-process lock for the destination CSV.
     2. Read the latest persisted rows while holding the lock.
     3. Resolve the target uniquely by ``grade_tracker.calc.assessment_key``.
-    4. Apply the requested changes in memory.
-    5. Validate the complete updated record with ``validate_grade``.
-    6. Reject the edit if the resulting identity duplicates another record
+    4. Verify expected_revision against the target record's current revision token.
+    5. Apply the requested changes in memory.
+    6. Validate the complete updated record with ``validate_grade``.
+    7. Reject the edit if the resulting identity duplicates another record
        (the target itself is excluded, so retakes are unaffected).
-    7. Write the complete CSV to a temp file in the same directory, flush and
+    8. Write the complete CSV to a temp file in the same directory, flush and
        ``fsync`` it, then ``os.replace`` it over the original.
-    8. Release the lock reliably (context manager), including on exceptions.
+    9. Release the lock reliably (context manager), including on exceptions.
 
     ``edit_grade`` and ``save_grade`` never call each other, and only these
     public entry points acquire the lock, so the transaction never
@@ -612,6 +692,9 @@ def edit_grade(
     }
     if all(value is None for value in changes.values()):
         raise ValueError("no changes requested")
+
+    if expected_revision is not None:
+        validate_revision_token(expected_revision)
 
     target_key = assessment_key(student_id, semester, subject, date)
 
@@ -669,6 +752,27 @@ def edit_grade(
             if value is None or value == "":
                 return default
             return value
+
+        # Compute current revision token and verify expected_revision precondition
+        if expected_revision is not None:
+            validate_revision_token(expected_revision)
+            current_record_dict = {
+                "student_id": current("student_id", ""),
+                "subject": current("subject", ""),
+                "score": current("score", "0"),
+                "max_score": current("max_score", "0"),
+                "date": current("date", ""),
+                "credits": current("credits", "3.0"),
+                "semester": current("semester", "1"),
+            }
+            actual_revision = compute_record_revision_token(current_record_dict)
+            if actual_revision != expected_revision:
+                raise ValueError(
+                    f"stale revision conflict for student '{student_id}' in {subject} "
+                    f"(semester {semester}) on {date}: expected revision {expected_revision}, "
+                    f"but current revision is {actual_revision}. "
+                    "Please inspect the current record with 'list' and retry if appropriate."
+                )
 
         # Apply the requested changes in memory; omitted fields keep their
         # existing raw values and are never silently defaulted.  Numeric
@@ -1311,6 +1415,7 @@ def cmd_import(args):
 
 
 def cmd_list(args):
+    include_revisions = bool(getattr(args, "revisions", False))
     if _format_name(args) == JSON_FORMAT:
         try:
             grades = _load_grades_for_json(args.data, "list")
@@ -1324,7 +1429,10 @@ def cmd_list(args):
             {
                 "command": "list",
                 "count": len(grades),
-                "grades": [_grade_json_record(g) for g in grades],
+                "grades": [
+                    _grade_json_record(g, include_revision_token=include_revisions)
+                    for g in grades
+                ],
             }
         )
         return
@@ -1334,11 +1442,19 @@ def cmd_list(args):
         print("No grades found.")
         return
 
-    print(f"{'Student ID':<12} {'Subject':<20} {'Score':<10} {'Max':<8} {'Grade':<6} {'Date':<12}")
-    print("-" * 72)
-    for g in grades:
-        lg = letter_grade(g["score"], g["max_score"])
-        print(f"{g['student_id']:<12} {g['subject']:<20} {g['score']:<10.1f} {g['max_score']:<8.1f} {lg:<6} {g['date']:<12}")
+    if include_revisions:
+        print(f"{'Student ID':<12} {'Subject':<20} {'Score':<10} {'Max':<8} {'Grade':<6} {'Date':<12} {'Revision':<71}")
+        print("-" * 145)
+        for g in grades:
+            lg = letter_grade(g["score"], g["max_score"])
+            rev = compute_record_revision_token(g)
+            print(f"{g['student_id']:<12} {g['subject']:<20} {g['score']:<10.1f} {g['max_score']:<8.1f} {lg:<6} {g['date']:<12} {rev:<71}")
+    else:
+        print(f"{'Student ID':<12} {'Subject':<20} {'Score':<10} {'Max':<8} {'Grade':<6} {'Date':<12}")
+        print("-" * 72)
+        for g in grades:
+            lg = letter_grade(g["score"], g["max_score"])
+            print(f"{g['student_id']:<12} {g['subject']:<20} {g['score']:<10.1f} {g['max_score']:<8.1f} {lg:<6} {g['date']:<12}")
 
 
 def cmd_summary(args):
@@ -1657,6 +1773,7 @@ def cmd_edit(args):
             new_semester=args.new_semester,
             new_subject=args.new_subject,
             new_date=args.new_date,
+            expected_revision=getattr(args, "expected_revision", None),
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -1994,6 +2111,11 @@ def main():
 
     # list
     p_list = subparsers.add_parser("list", help="List all grades")
+    p_list.add_argument(
+        "--revisions",
+        action="store_true",
+        help="Include revision tokens in list output for optimistic concurrency control",
+    )
     _add_format_argument(p_list)
     p_list.set_defaults(func=cmd_list)
 
@@ -2102,6 +2224,12 @@ def main():
     p_edit.add_argument(
         "--date", dest="new_date", default=None,
         help="New date, YYYY-MM-DD (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--expected-revision",
+        dest="expected_revision",
+        default=None,
+        help="Expected revision token of target record for optimistic concurrency control (sha256:<digest>)",
     )
     p_edit.set_defaults(func=cmd_edit)
 

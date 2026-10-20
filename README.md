@@ -23,7 +23,7 @@ On Windows, use `python` instead of `python3`.
 | `explain <student_id> [--semester N] [--format json]` | Explains how assessment marks contribute to a student's SGPA and CGPA; `--format json` emits a JSON document |
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester> [--allow-duplicate]` | Adds a mark; opt in when recording a separate same-day assessment |
-| `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
+| `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD] [--expected-revision TOKEN]` | Edits one existing mark with optional optimistic concurrency control |
 | `export [--output path]` | Writes an HTML report, `reports/index.html` by default |
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
@@ -33,6 +33,44 @@ On Windows, use `python` instead of `python3`.
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
 
 The whole update runs as one transaction: the command takes the same cross-process lock `add` uses, re-reads the file, applies the change in memory, validates it with the same rules as `add` (score between 0 and `max_score`, `max_score` greater than 0, `date` in `YYYY-MM-DD`), checks that the resulting identity does not duplicate a *different* record, then writes a temporary file next to the CSV, flushes it, and atomically replaces the original. If the target is missing, several records match it (ambiguous), validation fails, or the write fails, the command exits 2 with an error on stderr and the file is left byte-for-byte unchanged. Retakes in a different semester or on a different date are still allowed, because they are different assessments.
+
+### Optimistic Concurrency Control
+
+To prevent stale updates in multi-user or concurrent workflows (where one user might edit a record based on an out-of-date view, accidentally overwriting another user's recent changes), `edit` supports an optional `--expected-revision <token>` precondition.
+
+```bash
+# 1. Inspect records and obtain revision tokens
+python3 -m grade_tracker list --revisions
+python3 -m grade_tracker list --revisions --format json
+
+# 2. Perform a conditional edit
+python3 -m grade_tracker edit CS101 1 Mathematics 2026-10-06 --score 95 --expected-revision sha256:3f5df68ca98d5825b106d9e85eac16b9dd14b245fed4ac88c5f45b619d410cc7
+```
+
+#### Revision Token Format and Generation
+- **Format**: `sha256:<64-lowercase-hex-digits>` (e.g. `sha256:3f5df68ca98d5825b106d9e85eac16b9dd14b245fed4ac88c5f45b619d410cc7`).
+- **Generation**: Computed deterministically using SHA-256 over the canonical JSON serialization (`sort_keys=True`, normalized floats and strings) of all persisted canonical record fields: `student_id`, `subject`, `score`, `max_score`, `date`, `credits`, and `semester`.
+- **Determinism**: Independent of timestamps, process state, or formatting. Any change to any persisted record field alters the token, while identical records produce the identical token across platforms and processes.
+- **Privacy**: Tokens are cryptographic digests and do not embed raw record values.
+
+#### How It Works Under Lock
+1. When `--expected-revision` is supplied, its format is validated.
+2. The inter-process lock (`_InterProcessLock`) is acquired for the target CSV.
+3. The latest CSV content is read from disk under the lock.
+4. The target record is resolved by its assessment identity `(student_id, semester, subject, date)`. Missing and ambiguous records are rejected.
+5. The record's current revision token is computed under lock and compared against `--expected-revision`.
+6. If the tokens differ, the edit is rejected with exit code 2:
+   ```
+   Error: stale revision conflict for student 'CS101' in Mathematics (semester 1) on 2026-10-06: expected revision sha256:..., but current revision is sha256:... Please inspect the current record with 'list' and retry if appropriate.
+   ```
+   The CSV remains completely untouched (byte-for-byte unchanged).
+7. If the tokens match, the edit proceeds, undergoes full validation, and is written atomically to disk before releasing the lock.
+
+#### Why Users Should Re-inspect Before Retrying
+The CLI deliberately does **not** auto-retry conflicting edits. Auto-retrying would defeat the purpose of optimistic concurrency control by silently overwriting changes made by another process or collaborator. Users must re-inspect the updated record with `list --revisions` to verify the latest state before deciding whether to apply their change.
+
+#### Backward Compatibility
+`--expected-revision` is completely optional. Legacy scripts and workflows that call `edit` without `--expected-revision` continue to behave exactly as before. Existing JSON contracts remain fully compatible; revision tokens are exposed in JSON mode only when `--revisions` is passed.
 
 `add` normally rejects a second row with the same student, semester, subject,
 and date so a corrected score cannot accidentally become another assessment;
