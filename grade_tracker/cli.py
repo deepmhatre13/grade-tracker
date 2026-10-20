@@ -26,6 +26,13 @@ from grade_tracker.calc import (
     validate_grade,
 )
 from grade_tracker.export import build_html
+from grade_tracker.journal import (
+    JOURNAL_FORMAT_VERSION,
+    TransactionJournalCoordinator,
+    TransactionJournalEntry,
+    compute_file_sha256,
+    get_journal_dir,
+)
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "grades.csv"
 BACKUP_FORMAT_VERSION = "1.0"
@@ -434,41 +441,43 @@ def _read_existing_rows(path):
         return True, list(reader)
 
 
-def _atomic_write_rows(path, rows):
-    """Write ``rows`` (data records, no header) to ``path`` atomically.
+def _validate_staged_csv(staged_path):
+    """Validate staged CSV header and records before committing.
 
-    Writes to a temporary file in the same directory, flushes and ``fsync``\\ s
-    it, then ``os.replace``\\ s it over the target.  On any failure before the
-    replace succeeds the original file is left byte-for-byte unchanged and the
-    temporary file is removed.  Callers must hold the inter-process lock.
+    Allows legacy 5-column records if they were already present in legacy format.
+    """
+    diagnostics = audit_grades_csv(staged_path)
+    # If any errors exist, check if they are solely due to expected legacy rows
+    # (i.e. expected 7 fields, got 5).
+    filtered = [
+        d for d in diagnostics
+        if not ("expected 7 fields, got 5" in d or "expected 7 fields, got 6" in d)
+    ]
+    if filtered:
+        detail = filtered[0] if len(filtered) == 1 else f"{len(filtered)} problems found (first: {filtered[0]})"
+        raise ValueError(f"staged CSV validation failed: {detail}")
+
+
+def _atomic_write_rows(path, rows, mutation_type="write"):
+    """Write ``rows`` (data records, no header) to ``path`` using the transaction journal.
+
+    Uses TransactionJournalCoordinator for write-ahead logging, staging, atomic replacement,
+    checksum verification, and crash recovery. Callers must hold the inter-process lock.
     """
     path = Path(path)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".grades-", suffix=".tmp"
+    expected_header = [
+        "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+    ]
+    coordinator = TransactionJournalCoordinator(path)
+    coordinator.execute_mutation(
+        mutation_type=mutation_type,
+        mutate_rows_fn=lambda _existing: rows,
+        header=expected_header,
+        validate_staged_fn=lambda staged: _validate_staged_csv(staged),
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["student_id", "subject", "score", "max_score", "date", "credits", "semester"]
-            )
-            for row in rows:
-                writer.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())
-
-        # Atomically replace the target CSV.
-        os.replace(tmp_name, path)
-        tmp_name = None
-    finally:
-        if tmp_name is not None:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
 
 
-def _append_row(path, row):
+def _append_row(path, row, mutation_type="add"):
     """Append one raw CSV row to ``path`` using atomic persistence.
 
     Shared by ``save_grade`` and ``edit_grade``; both callers must already
@@ -478,7 +487,7 @@ def _append_row(path, row):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _, existing_rows = _read_existing_rows(path)
-    _atomic_write_rows(path, list(existing_rows) + [row])
+    _atomic_write_rows(path, list(existing_rows) + [row], mutation_type=mutation_type)
 
 
 def save_grade(
@@ -518,6 +527,15 @@ def save_grade(
 
     lock_file = _lock_path_for(csv_path)
     with _InterProcessLock(lock_file) as _lock:
+        # Recover pending transactions before reading or mutating
+        coordinator = TransactionJournalCoordinator(csv_path)
+        outcomes = coordinator.recover(validate_staged_fn=lambda staged: _validate_staged_csv(staged))
+        for outcome in outcomes:
+            if outcome.get("status") == "ambiguous":
+                raise ValueError(
+                    f"Refusing to execute mutation: pending transaction in ambiguous state: {outcome.get('error')}"
+                )
+
         # Read the latest persisted records while holding the lock.
         existing = load_grades(csv_path)
 
@@ -636,6 +654,15 @@ def edit_grade(
 
     lock_file = _lock_path_for(csv_path)
     with _InterProcessLock(lock_file) as _lock:
+        # Recover pending transactions before reading or mutating
+        coordinator = TransactionJournalCoordinator(csv_path)
+        outcomes = coordinator.recover(validate_staged_fn=lambda staged: _validate_staged_csv(staged))
+        for outcome in outcomes:
+            if outcome.get("status") == "ambiguous":
+                raise ValueError(
+                    f"Refusing to execute mutation: pending transaction in ambiguous state: {outcome.get('error')}"
+                )
+
         # Read the latest persisted rows while holding the lock.
         _, rows = _read_existing_rows(path)
 
@@ -715,7 +742,7 @@ def edit_grade(
 
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _atomic_write_rows(path, rows)
+            _atomic_write_rows(path, rows, mutation_type="edit")
         except ValueError:
             # Schema refusal from a racing rewrite; already a user-facing error.
             raise
@@ -1161,6 +1188,15 @@ def import_grades_csv(source_path, dest_path=DEFAULT_DATA_PATH, on_conflict="err
 
     lock_file = _lock_path_for(dest)
     with _InterProcessLock(lock_file) as _lock:
+        # Recover pending transactions before reading or mutating
+        coordinator = TransactionJournalCoordinator(dest)
+        outcomes = coordinator.recover(validate_staged_fn=lambda staged: _validate_staged_csv(staged))
+        for outcome in outcomes:
+            if outcome.get("status") == "ambiguous":
+                raise ValueError(
+                    f"Refusing to execute mutation: pending transaction in ambiguous state: {outcome.get('error')}"
+                )
+
         existing_grades = load_grades(dest)
         existing_keys = set()
         for grade in existing_grades:
@@ -1208,38 +1244,20 @@ def import_grades_csv(source_path, dest_path=DEFAULT_DATA_PATH, on_conflict="err
                 if header is not None:
                     existing_rows = list(reader)
 
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(dest.parent), prefix=".grades-", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(expected_header)
-                for row in existing_rows:
-                    writer.writerow(row)
-                for rec in records_to_insert:
-                    writer.writerow(
-                        [
-                            rec["student_id"],
-                            rec["subject"],
-                            rec["score"],
-                            rec["max_score"],
-                            rec["date"],
-                            rec["credits"],
-                            rec["semester"],
-                        ]
-                    )
-                f.flush()
-                os.fsync(f.fileno())
+        rows_to_write = list(existing_rows) + [
+            [
+                rec["student_id"],
+                rec["subject"],
+                rec["score"],
+                rec["max_score"],
+                rec["date"],
+                rec["credits"],
+                rec["semester"],
+            ]
+            for rec in records_to_insert
+        ]
 
-            os.replace(tmp_name, dest)
-            tmp_name = None
-        finally:
-            if tmp_name is not None:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
+        _atomic_write_rows(dest, rows_to_write, mutation_type="import")
 
     return ImportResult(
         imported=total_imported,
@@ -1986,6 +2004,60 @@ def cmd_restore(args):
     raise SystemExit(0)
 
 
+def cmd_transactions(args):
+    """Inspect transaction journal records for the grade data file."""
+    coordinator = TransactionJournalCoordinator(args.data)
+    tx_list = coordinator.inspect_status()
+    journal_dir = str(coordinator.journal_dir)
+
+    status_filter = getattr(args, "status_filter", None)
+    if status_filter:
+        filter_status = status_filter.upper()
+        tx_list = [
+            tx for tx in tx_list
+            if tx.get("state", "").upper() == filter_status
+        ]
+
+    needs_recovery = any(tx.get("needs_recovery", False) for tx in tx_list)
+    count = len(tx_list)
+
+    if _format_name(args) == JSON_FORMAT:
+        payload = {
+            "command": "transactions",
+            "target_csv": str(Path(args.data).resolve()),
+            "journal_dir": journal_dir,
+            "count": count,
+            "needs_recovery": needs_recovery,
+            "transactions": tx_list,
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(f"Transaction Journal for: {Path(args.data).resolve()}")
+    print(f"Journal Directory: {journal_dir}")
+    print(f"Transactions Recorded: {count}")
+    if needs_recovery:
+        print("Status: RECOVERY NEEDED (pending transaction detected)")
+    else:
+        print("Status: CLEAN (all transactions completed or no transactions)")
+
+    if not tx_list:
+        print("\nNo transaction journal records found.")
+        return
+
+    print("\n" + f"{'TX ID':<38} {'MUTATION':<10} {'STATE':<12} {'HEALTH':<12} {'RECOVERY':<10} {'CREATED AT'}")
+    print("-" * 105)
+    for tx in tx_list:
+        tx_id = tx.get("tx_id", "UNKNOWN")
+        mutation = tx.get("mutation_type", "unknown")
+        state = tx.get("state", "UNKNOWN")
+        health = tx.get("health", "unknown")
+        rec = "YES" if tx.get("needs_recovery") else "NO"
+        created = tx.get("created_at", "")
+        print(f"{tx_id:<38} {mutation:<10} {state:<12} {health:<12} {rec:<10} {created}")
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
@@ -2125,6 +2197,20 @@ def main():
     )
     p_restore.add_argument("backup_path", help="Path to backup CSV or JSON manifest")
     p_restore.set_defaults(func=cmd_restore)
+
+    # transactions
+    p_transactions = subparsers.add_parser(
+        "transactions", help="Inspect write-ahead transaction journal status and history"
+    )
+    p_transactions.add_argument(
+        "--status",
+        dest="status_filter",
+        choices=["PREPARED", "COMMITTING", "COMMITTED", "ABORTED", "prepared", "committing", "committed", "aborted"],
+        default=None,
+        help="Filter transactions by state (PREPARED, COMMITTING, COMMITTED, ABORTED)",
+    )
+    _add_format_argument(p_transactions)
+    p_transactions.set_defaults(func=cmd_transactions)
 
     args = parser.parse_args()
     if not args.command:

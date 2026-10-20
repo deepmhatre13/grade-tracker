@@ -28,6 +28,7 @@ On Windows, use `python` instead of `python3`.
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
+| `transactions [--status {PREPARED,COMMITTING,COMMITTED,ABORTED}] [--format json]` | Inspects write-ahead transaction journal status and history |
 
 
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
@@ -62,6 +63,59 @@ repeated rows are still rejected and counted only once.
 - Temporary files are cleaned up on any failure, leaving the original destination byte-for-byte unchanged.
 - If the destination does not yet exist, its directory structure is created and the file is safely established.
 - Concurrency & atomicity limitations: Advisory locks protect coordinating processes using this CLI. Durability is bounded by the underlying OS filesystem guarantees.
+
+### Crash-Recoverable Transaction Journal
+
+All grade mutation operations (`add`, `edit`, and `import`) execute under a write-ahead transaction journal coordinator to guarantee atomic, durable, and crash-recoverable state transitions across OS crashes or power interruptions.
+
+#### Architecture and Storage Layout
+- Transaction journals are stored in a dedicated directory adjacent to the data CSV named `.tx_journal_<csv_filename>` (for example, `data/.tx_journal_grades.csv/`).
+- Staged mutation files are written directly in the same filesystem directory using the naming convention `.tx_stage_<tx_id>.tmp`.
+- Journal entries are stored as `<tx_id>.json` files using JSON format version `1.0`. Journal entries strictly record transaction metadata and cryptographic hashes without duplicating raw student grade data.
+
+#### Transaction Journal Schema (`version: "1.0"`)
+| Field | Type | Description |
+|---|---|---|
+| `version` | string | Format version (`"1.0"`) |
+| `tx_id` | string | Canonical UUID identifying the mutation |
+| `mutation_type` | string | Operation type (`"add"`, `"edit"`, or `"import"`) |
+| `target_csv` | string | Absolute path to the destination CSV |
+| `source_checksum` | string \| null | SHA-256 hex digest of the target CSV before mutation (`null` if newly created) |
+| `target_checksum` | string | SHA-256 hex digest of the staged post-mutation file |
+| `staged_filename` | string | Basename of the staged temporary file in the target directory |
+| `state` | string | Current transaction state: `PREPARED`, `COMMITTING`, `COMMITTED`, or `ABORTED` |
+| `created_at` | string | ISO 8601 UTC timestamp of transaction creation |
+| `updated_at` | string | ISO 8601 UTC timestamp of last state transition |
+
+#### Write-Ahead Commit Protocol
+1. **Lock Acquisition**: Acquire the target CSV's advisory inter-process lock (`_InterProcessLock`).
+2. **Crash Recovery**: Run pending transaction recovery before reading or applying mutations.
+3. **Source Checksum**: Compute initial SHA-256 hash of the target CSV and verify existing schema.
+4. **Staging & Fsync**: Write mutated records to a temporary file (`.tx_stage_<tx_id>.tmp`), flush buffers, and invoke `os.fsync`.
+5. **Staged Audit**: Audit staged file integrity (`audit_grades_csv`) prior to commit.
+6. **PREPARED State**: Write and fsync `<tx_id>.json` in `PREPARED` state with `source_checksum` and `target_checksum`.
+7. **COMMITTING State**: Write and fsync `<tx_id>.json` in `COMMITTING` state.
+8. **Atomic Replacement**: Atomically replace the destination CSV (`os.replace`) with the staged file.
+9. **Verification**: Verify target CSV checksum matches `target_checksum`.
+10. **COMMITTED State**: Write and fsync `<tx_id>.json` in `COMMITTED` state.
+11. **Pruning**: Prune oldest completed journals exceeding retention limit (`retention_limit=50`).
+
+#### Recovery Decision Rules
+When a mutation process recovers pending transactions under lock:
+- **Case A (Replace Succeeded)**: Target dataset checksum matches `target_checksum`. The atomic replacement succeeded prior to crash; journal is finalized as `COMMITTED` and staged file is cleaned up.
+- **Case B (Prepared Rollback)**: Target dataset checksum matches `source_checksum` and state is `PREPARED`. The replacement did not occur; journal is marked `ABORTED` and the staged file is removed.
+- **Case C (Committing Replay)**: Target dataset checksum matches `source_checksum` and state is `COMMITTING`. If the staged file exists, matches `target_checksum`, and passes audit, recovery completes the atomic replacement, verifies checksum, and marks `COMMITTED`. If staged file is missing or invalid, recovery fails closed as ambiguous.
+- **Case D (Checksum Mismatch)**: Target dataset checksum matches neither `source_checksum` nor `target_checksum`. Fails closed as ambiguous; manual operator intervention required without altering files.
+- **Case E (Malformed Journal)**: Corrupt JSON, invalid UUID, or path traversal detected. Fails closed as ambiguous; manual operator intervention required.
+
+#### Inspection Command (`transactions`)
+Inspect write-ahead transaction journal status and history without acquiring locks or altering data files:
+```bash
+python3 -m grade_tracker transactions
+python3 -m grade_tracker transactions --status PREPARED
+python3 -m grade_tracker transactions --format json
+```
+
 
 ## How it's supposed to work
 
