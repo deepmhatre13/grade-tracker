@@ -251,6 +251,111 @@ class TestEditTargetResolution(EditTestCase):
         self.assertEqual(self.file_bytes(), before)
         self.assertEqual(len(self.read_rows()), 2)
 
+    def test_current_score_selects_one_same_day_assessment(self):
+        self.write_csv([
+            "S1,Mathematics,50,100,2026-10-06,3,1\n",
+            "S1,Mathematics,60,100,2026-10-06,3,1\n",
+        ])
+
+        code, stdout, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "60", "--score", "75",
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("Edited grade", stdout)
+        rows = self.read_rows()
+        self.assertEqual([row["score"] for row in rows], ["50", "75.0"])
+
+    def test_current_selectors_must_resolve_exactly_one_record(self):
+        self.write_csv([
+            "S1,Mathematics,50,100,2026-10-06,3,1\n",
+            "S1,Mathematics,50,50,2026-10-06,4,1\n",
+        ])
+        before = self.file_bytes()
+
+        code, _, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "50", "--score", "45",
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("ambiguous target", stderr)
+        self.assertIn("--current-max-score", stderr)
+        self.assertEqual(self.file_bytes(), before)
+
+    def test_current_max_score_and_credits_can_disambiguate(self):
+        self.write_csv([
+            "S1,Mathematics,50,100,2026-10-06,3,1\n",
+            "S1,Mathematics,50,50,2026-10-06,4,1\n",
+        ])
+
+        code, _, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "50", "--current-max-score", "50",
+            "--current-credits", "4", "--score", "45",
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        rows = self.read_rows()
+        self.assertEqual([row["score"] for row in rows], ["50", "45.0"])
+
+    def test_unmatched_current_selector_preserves_file(self):
+        self.write_csv([
+            "S1,Mathematics,50,100,2026-10-06,3,1\n",
+            "S1,Mathematics,60,100,2026-10-06,3,1\n",
+        ])
+        before = self.file_bytes()
+
+        code, stdout, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "99", "--score", "75",
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("matching the supplied current values", stderr)
+        self.assertEqual(self.file_bytes(), before)
+
+    def test_add_allow_duplicate_then_edit_one_assessment(self):
+        first = self.run_cli(
+            "add", "S1", "Mathematics", "95", "100",
+            "2026-10-06", "3", "1",
+        )
+        second = self.run_cli(
+            "add", "S1", "Mathematics", "55", "100",
+            "2026-10-06", "3", "1", "--allow-duplicate",
+        )
+
+        code, _, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "55", "--score", "75",
+        )
+
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 0)
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(
+            [row["score"] for row in self.read_rows()],
+            ["95.0", "75.0"],
+        )
+
+    def test_edit_same_day_assessment_rejects_exact_record_duplicate(self):
+        self.write_csv([
+            "S1,Mathematics,50,100,2026-10-06,3,1\n",
+            "S1,Mathematics,60,100,2026-10-06,3,1\n",
+        ])
+        before = self.file_bytes()
+
+        code, _, stderr = self.run_edit(
+            "S1", "1", "Mathematics", "2026-10-06",
+            "--current-score", "60", "--score", "50",
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("same grade data", stderr)
+        self.assertEqual(self.file_bytes(), before)
+
 
 class TestEditDuplicatePrevention(EditTestCase):
     """Edits must not create a duplicate assessment identity."""

@@ -17,6 +17,7 @@ from pathlib import Path
 from grade_tracker.calc import (
     assessment_key as calc_assessment_key,
     assessment_record_key as calc_assessment_record_key,
+    calculate_target_sgpa,
     cgpa,
     explain_student_gpa,
     letter_grade,
@@ -567,11 +568,16 @@ def edit_grade(
     new_semester=None,
     new_subject=None,
     new_date=None,
+    current_score=None,
+    current_max_score=None,
+    current_credits=None,
 ):
     """Edit one existing grade row in ``csv_path`` as a single transaction.
 
     The target record is identified by its current assessment identity
-    ``(student_id, semester, subject, date)``.  Any change option left as
+    ``(student_id, semester, subject, date)``.  When same-day assessments
+    share that identity, the optional ``current_*`` values narrow the match
+    using the record's values before editing. Any change option left as
     ``None`` keeps the record's existing value — omitted options are never
     replaced with defaults.
 
@@ -634,6 +640,28 @@ def edit_grade(
             cell(row, "date") or "",
         )
 
+    def numeric_cell(row, name, default):
+        value = cell(row, name)
+        if value is None or value == "":
+            value = default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def row_record_key(row):
+        return calc_assessment_record_key(
+            {
+                "student_id": cell(row, "student_id") or "",
+                "semester": cell(row, "semester") or "1",
+                "subject": cell(row, "subject") or "",
+                "date": cell(row, "date") or "",
+                "score": numeric_cell(row, "score", 0.0),
+                "max_score": numeric_cell(row, "max_score", 0.0),
+                "credits": numeric_cell(row, "credits", 3.0),
+            }
+        )
+
     lock_file = _lock_path_for(csv_path)
     with _InterProcessLock(lock_file) as _lock:
         # Read the latest persisted rows while holding the lock.
@@ -648,17 +676,29 @@ def edit_grade(
             if _row_has_visible_content(row) and row_key(row) == target_key
         ]
 
+        selectors = (
+            ("score", current_score, 0.0),
+            ("max_score", current_max_score, 0.0),
+            ("credits", current_credits, 3.0),
+        )
+        for name, expected, default in selectors:
+            if expected is not None:
+                matches = [
+                    position for position in matches
+                    if numeric_cell(rows[position], name, default) == expected
+                ]
+
         if not matches:
             raise ValueError(
                 f"no record found for student '{student_id}' (semester {semester}) "
-                f"in {subject} on {date}"
+                f"in {subject} on {date} matching the supplied current values"
             )
         if len(matches) > 1:
             raise ValueError(
                 f"ambiguous target: {len(matches)} records match student "
                 f"'{student_id}' (semester {semester}) in {subject} on {date}; "
-                "the file contains duplicate assessments — repair it with "
-                "'validate' before editing"
+                "use --current-score, --current-max-score, and/or "
+                "--current-credits to select one assessment"
             )
 
         target_position = matches[0]
@@ -692,19 +732,34 @@ def edit_grade(
             float(updated["credits"]),
         )
 
-        # The resulting identity must not collide with any *other* record;
-        # the target itself is excluded so retakes and other legitimate
-        # duplicates targeting the same row remain unaffected.
-        new_key = assessment_key(
-            updated["student_id"], updated["semester"], updated["subject"], updated["date"]
+        # Same-day assessments may intentionally share the target's existing
+        # four-field identity, so value-only edits reject only a complete
+        # stored-record duplicate. Moving a record onto a different identity
+        # remains conservative and requires that identity to be unused.
+        new_identity = assessment_key(
+            updated["student_id"], updated["semester"],
+            updated["subject"], updated["date"]
+        )
+        new_key = calc_assessment_record_key(
+            {
+                **updated,
+                "score": float(updated["score"]),
+                "max_score": float(updated["max_score"]),
+                "credits": float(updated["credits"]),
+            }
         )
         for position, row in enumerate(rows):
             if position == target_position or not _row_has_visible_content(row):
                 continue
-            other_key = row_key(row)
-            if other_key is not None and other_key == new_key:
+            other_identity = row_key(row)
+            is_duplicate = (
+                other_identity == new_identity
+                if new_identity != target_key
+                else row_record_key(row) == new_key
+            )
+            if is_duplicate:
                 raise ValueError(
-                    "assessment already exists for student "
+                    "assessment already exists with the same grade data for student "
                     f"'{updated['student_id']}' in {updated['subject']} "
                     f"(semester {updated['semester']}) on {updated['date']}"
                 )
@@ -1717,6 +1772,108 @@ def cmd_explain(args):
     print("=" * 60)
 
 
+def cmd_target_gpa(args):
+    """Calculate required SGPA in upcoming credits to achieve a target CGPA."""
+    target_cgpa = args.target
+    upcoming_credits = args.credits
+
+    # Validate target and credits bounds
+    if not (0.0 <= target_cgpa <= 10.0):
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "invalid_argument",
+                        "message": "Target CGPA must be between 0.0 and 10.0.",
+                    },
+                }
+            )
+        else:
+            print("Error: target CGPA must be between 0.0 and 10.0.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if upcoming_credits <= 0.0:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "invalid_argument",
+                        "message": "Upcoming credits must be greater than 0.",
+                    },
+                }
+            )
+        else:
+            print("Error: upcoming credits must be greater than 0.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "target-gpa")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "target-gpa"
+            payload["student_id"] = args.student_id
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        student_records = [g for g in grades if g.get("student_id") == args.student_id]
+        if not student_records:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "student_not_found",
+                        "message": f"Student '{args.student_id}' does not exist.",
+                    },
+                }
+            )
+            raise SystemExit(1)
+
+        res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+        _emit_json(
+            {
+                "command": "target-gpa",
+                "student_id": res["student_id"],
+                "current_cgpa": res["current_cgpa"],
+                "current_credits": res["current_credits"],
+                "target_cgpa": res["target_cgpa"],
+                "upcoming_credits": res["upcoming_credits"],
+                "total_future_credits": res["total_future_credits"],
+                "required_sgpa": res["required_sgpa"],
+                "is_achievable": res["is_achievable"],
+                "max_possible_cgpa": res["max_possible_cgpa"],
+            }
+        )
+        return
+
+    grades = load_grades(args.data)
+    student_records = [g for g in grades if g.get("student_id") == args.student_id]
+    if not student_records:
+        print(f"Error: student '{args.student_id}' does not exist.", file=sys.stderr)
+        raise SystemExit(1)
+
+    res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+    curr_cgpa_str = f"{res['current_cgpa']:.2f}" if res["current_cgpa"] is not None else "N/A"
+    print(f"Student: {res['student_id']}")
+    print(f"Current CGPA: {curr_cgpa_str} (over {res['current_credits']:.1f} credits)")
+    print(f"Target CGPA:  {res['target_cgpa']:.2f}")
+    print(f"Upcoming:     {res['upcoming_credits']:.1f} credits")
+    print()
+    if res["is_achievable"]:
+        print("Result: Achievable")
+        print(f"Required SGPA: {res['required_sgpa']:.2f}")
+    else:
+        print("Result: Unachievable in the upcoming semester")
+        print(
+            f"Maximum achievable CGPA: {res['max_possible_cgpa']:.2f} (with a perfect 10.00 SGPA)"
+        )
+
+
 def cmd_average(args):
     if _format_name(args) == JSON_FORMAT:
         try:
@@ -1804,6 +1961,9 @@ def cmd_edit(args):
             new_semester=args.new_semester,
             new_subject=args.new_subject,
             new_date=args.new_date,
+            current_score=args.current_score,
+            current_max_score=args.current_max_score,
+            current_credits=args.current_credits,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -2193,6 +2353,21 @@ def main():
     _add_format_argument(p_explain)
     p_explain.set_defaults(func=cmd_explain)
 
+    # target-gpa
+    p_target = subparsers.add_parser("target-gpa", help="Calculate required SGPA for a target CGPA")
+    p_target.add_argument("student_id", help="Student ID")
+    p_target.add_argument("--target", type=float, required=True, help="Target CGPA (0.0 to 10.0)")
+    p_target.add_argument("--credits", type=float, required=True, help="Upcoming semester credits (> 0)")
+    _add_format_argument(p_target)
+    p_target.add_argument(
+        "--json",
+        action="store_const",
+        const=JSON_FORMAT,
+        dest="format",
+        help="Output JSON (shorthand for --format json)",
+    )
+    p_target.set_defaults(func=cmd_target_gpa)
+
     # average
     p_avg = subparsers.add_parser("average", help="Show average for a subject")
     p_avg.add_argument("subject", help="Subject name")
@@ -2246,7 +2421,8 @@ def main():
         description=(
             "Edit an existing grade record. The target record is identified "
             "by its current assessment identity: STUDENT_ID, SEMESTER, "
-            "SUBJECT, and DATE. Omitted change options keep the record's "
+            "SUBJECT, and DATE. Use the --current-* selectors when multiple "
+            "same-day assessments share that identity. Omitted change options keep the record's "
             "current value; at least one change option is required. The edit "
             "is applied as a single transaction under the same cross-process "
             "lock and atomic write used by 'add'. If the target does not "
@@ -2258,6 +2434,18 @@ def main():
     p_edit.add_argument("semester", help="Semester of the record to edit")
     p_edit.add_argument("subject", help="Subject of the record to edit")
     p_edit.add_argument("date", help="Date of the record to edit (YYYY-MM-DD)")
+    p_edit.add_argument(
+        "--current-score", type=float, default=None,
+        help="Current score used to select one matching same-day assessment",
+    )
+    p_edit.add_argument(
+        "--current-max-score", type=float, default=None,
+        help="Current maximum score used to select one matching same-day assessment",
+    )
+    p_edit.add_argument(
+        "--current-credits", type=float, default=None,
+        help="Current credits used to select one matching same-day assessment",
+    )
     p_edit.add_argument(
         "--score", type=float, default=None,
         help="New score (omit to keep the current value)",

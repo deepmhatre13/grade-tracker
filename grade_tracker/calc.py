@@ -366,3 +366,105 @@ def subject_average(grades, subject):
 
     percentages = [percentage(g["score"], g["max_score"]) for g in matching]
     return round(float(sum(percentages) / len(percentages)), 2)
+
+
+def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
+    """Calculates required SGPA in upcoming credits to achieve a target CGPA.
+
+    Derives the required performance using exact unrounded point totals:
+        Required SGPA = (Target CGPA * (Current Credits + Upcoming Credits) - Current Points) / Upcoming Credits
+
+    Parameters:
+        grades: List of grade dicts.
+        student_id: ID of the student.
+        target_cgpa: Float, target cumulative GPA (0.0 <= target_cgpa <= 10.0).
+        upcoming_credits: Float, credits in the upcoming semester (> 0).
+
+    Returns:
+        dict:
+            - student_id: str
+            - student_exists: bool
+            - current_cgpa: float or None
+            - current_credits: float
+            - current_points: float
+            - target_cgpa: float
+            - upcoming_credits: float
+            - total_future_credits: float
+            - required_sgpa: float or None
+            - is_achievable: bool
+            - max_possible_cgpa: float
+    """
+    if not math.isfinite(target_cgpa) or not (0.0 <= target_cgpa <= 10.0):
+        raise ValueError("target_cgpa must be a finite number between 0.0 and 10.0")
+    if not math.isfinite(upcoming_credits) or upcoming_credits <= 0.0:
+        raise ValueError("upcoming_credits must be a finite number greater than 0")
+
+    student_records = [g for g in grades if g.get("student_id") == student_id]
+    if not student_records:
+        return {
+            "student_id": student_id,
+            "student_exists": False,
+            "current_cgpa": None,
+            "current_credits": 0.0,
+            "current_points": 0.0,
+            "target_cgpa": round(float(target_cgpa), 2),
+            "upcoming_credits": round(float(upcoming_credits), 2),
+            "total_future_credits": round(float(upcoming_credits), 2),
+            "required_sgpa": round(float(target_cgpa), 2),
+            "is_achievable": True,
+            "max_possible_cgpa": 10.0,
+        }
+
+    breakdown = calculate_gpa_breakdown(student_records)
+    current_credits = breakdown["total_credits"]
+    current_points = breakdown["total_points"]
+    current_cgpa = breakdown["gpa"]
+
+    total_future_credits = current_credits + upcoming_credits
+
+    if current_credits == 0.0:
+        return {
+            "student_id": student_id,
+            "student_exists": True,
+            "current_cgpa": None,
+            "current_credits": 0.0,
+            "current_points": 0.0,
+            "target_cgpa": round(float(target_cgpa), 2),
+            "upcoming_credits": round(float(upcoming_credits), 2),
+            "total_future_credits": round(float(total_future_credits), 2),
+            "required_sgpa": round(float(target_cgpa), 2),
+            "is_achievable": True,
+            "max_possible_cgpa": 10.0,
+        }
+
+    target_total_points = target_cgpa * total_future_credits
+    needed_points = target_total_points - current_points
+    raw_required_sgpa = needed_points / upcoming_credits
+
+    max_possible_points = current_points + (10.0 * upcoming_credits)
+    max_possible_cgpa = round(max_possible_points / total_future_credits, 2)
+
+    if raw_required_sgpa > 10.0:
+        is_achievable = False
+        required_sgpa = round(raw_required_sgpa, 2)
+    elif raw_required_sgpa <= 0.0:
+        is_achievable = True
+        required_sgpa = 0.0
+    else:
+        is_achievable = True
+        required_sgpa = round(raw_required_sgpa, 2)
+
+    return {
+        "student_id": student_id,
+        "student_exists": True,
+        "current_cgpa": current_cgpa,
+        "current_credits": current_credits,
+        "current_points": current_points,
+        "target_cgpa": round(float(target_cgpa), 2),
+        "upcoming_credits": round(float(upcoming_credits), 2),
+        "total_future_credits": round(float(total_future_credits), 2),
+        "required_sgpa": required_sgpa,
+        "is_achievable": is_achievable,
+        "max_possible_cgpa": max_possible_cgpa,
+    }
+
