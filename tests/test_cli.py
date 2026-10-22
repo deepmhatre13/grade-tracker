@@ -586,6 +586,7 @@ class TestJsonOutput(unittest.TestCase):
             "command": "list",
             "count": 0,
             "grades": [],
+            "policy": "legacy@1",
         })
 
     def test_summary_json_schema_sgpa_and_cgpa(self):
@@ -627,6 +628,7 @@ class TestJsonOutput(unittest.TestCase):
             "cgpa": None,
             "semesters": [],
             "grades": [],
+            "policy": "legacy@1",
         })
 
     def test_average_json_schema_and_null_for_no_matches(self):

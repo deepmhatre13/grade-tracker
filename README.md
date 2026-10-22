@@ -18,11 +18,12 @@ On Windows, use `python` instead of `python3`.
 
 | Command | Does |
 |---|---|
-| `list [--format json]` | Every mark, with its letter grade; `--format json` emits a JSON document |
-| `summary <student_id> [--format json]` | One student's marks and GPA; `--format json` emits a JSON document |
-| `explain <student_id> [--semester N] [--format json]` | Explains how assessment marks contribute to a student's SGPA and CGPA; `--format json` emits a JSON document |
-| `target-gpa <student_id> --target N --credits N [--format json]` | Calculates required SGPA in upcoming credits to achieve a target CGPA; `--format json` emits a JSON document |
+| `list [--format json] [--policy NAME]` | Every mark, with its letter grade; `--format json` emits a JSON document |
+| `summary <student_id> [--format json] [--policy NAME]` | One student's marks and GPA; `--format json` emits a JSON document |
+| `explain <student_id> [--semester N] [--format json] [--policy NAME]` | Explains how assessment marks contribute to a student's SGPA and CGPA; `--format json` emits a JSON document |
+| `target-gpa <student_id> --target N --credits N [--format json] [--policy NAME]` | Calculates required SGPA in upcoming credits to achieve a target CGPA; `--format json` emits a JSON document |
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
+| `policies [--format json]` | Lists the registered grading policies; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester> [--allow-duplicate]` | Adds a mark; opt in when recording a separate same-day assessment |
 
 | `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
@@ -30,7 +31,7 @@ On Windows, use `python` instead of `python3`.
 
 | `edit <student_id> <semester> <subject> <date> [--current-score N] [--current-max-score N] [--current-credits N] [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark; current-value selectors distinguish same-day assessments |
 
-| `export [--output path]` | Writes an HTML report, `reports/index.html` by default |
+| `export [--output path] [--policy NAME]` | Writes an HTML report, `reports/index.html` by default |
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
@@ -87,13 +88,78 @@ repeated rows are still rejected and counted only once.
 ## How it's supposed to work
 
 - Grades go by percentage: 90 and above is A, 80–89 B, 70–79 C, 60–69 D, below 60 F.
-- GPA is on a 4-point scale: A 4, B 3, C 2, D 1, F 0.
+- GPA is on a 10-point scale: A 10, B 9, C 8, D 7, F 0. These thresholds and
+  grade points come from the default grading policy (`legacy@1`); see
+  [Grading policies](#grading-policies) to use a different one.
 - A subject's average is the average percentage, so marks out of different totals compare fairly. 35/50 and 70/100 are both 70%.
 - `add`, `edit`, and `import` refuse negative or non-finite credits. Grade writes
   also reject a score below 0 or above the maximum, a maximum of 0 or less, and
   a date that isn't `YYYY-MM-DD`.
 - The report has a card for every student in the CSV, and only those.
 - Everything in the report is shown as plain text. A subject name containing HTML is displayed, not run.
+
+## Grading policies
+
+Every grade calculation runs under a *grading policy*: a versioned, immutable
+bundle of letter-grade thresholds, grade points, and rounding rules.  The
+default policy, `legacy@1`, reproduces exactly the behaviour Grade Tracker
+had before policies existed, so every command keeps its current results
+unless you ask for a different policy.
+
+```
+python3 -m grade_tracker policies
+python3 -m grade_tracker policies --format json
+python3 -m grade_tracker summary CS101 --policy legacy@1
+```
+
+- `--policy` accepts a bare identifier (`strict`, which resolves to the
+  highest registered version) or an exact `identifier@version` name
+  (`strict@1`).
+- `--policy` is available on `list`, `summary`, `explain`, `target-gpa`, and
+  `export`.
+- Selecting a policy that is not registered is an error, not a silent
+  fallback to the default.  Human output prints the reason on stderr and
+  exits 1; `--format json` emits an `unknown_policy` error document.
+- JSON output from `list`, `summary`, `explain`, and `target-gpa` includes a
+  `policy` field naming the policy that produced the numbers, and the HTML
+  report records the active policy in its header.
+
+### The default policy
+
+| Policy | Thresholds (inclusive) | Grade points | GPA rounding |
+|---|---|---|---|
+| `legacy@1` | A >= 90, B >= 80, C >= 70, D >= 60, F below 60 | A 10, B 9, C 8, D 7, F 0 | 2 decimals |
+
+A score exactly on a threshold receives that threshold's letter grade, and
+classification always uses the unrounded percentage.
+
+### Defining your own policy
+
+```python
+from grade_tracker.policies import Policy, register_policy
+
+strict = Policy(
+    identifier="strict",
+    version="1",
+    thresholds=((95, "A"), (85, "B"), (75, "C"), (65, "D")),
+    grade_points={"A": 10.0, "B": 9.0, "C": 8.0, "D": 7.0, "F": 0.0},
+    description="Stricter thresholds for a honours programme.",
+)
+register_policy(strict)
+```
+
+- Thresholds must be strictly descending and each letter grade must have
+  grade points.
+- `gpa_rounding_mode` is one of `half_up`, `half_even`, or `python`.
+  `python` reproduces Python's built-in `round()`, which is what the default
+  policy uses.
+- `additional_rules` takes callables that receive the unrounded percentage
+  and the policy, and may return a letter grade to override the thresholds.
+- A policy identity is `(identifier, version)`.  Registering the same pair
+  twice raises `DuplicatePolicyError`, so a published version can never be
+  silently redefined; publish a new version instead.
+- The calculation API also accepts a policy directly:
+  `cgpa(grades, "CS101", policy="strict@1")`, or a `Policy` instance.
 
 ## Explaining GPA Calculations
 

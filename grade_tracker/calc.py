@@ -33,8 +33,14 @@ from decimal import Decimal
 import math
 import re
 
+from grade_tracker.policies import resolve_policy
+
 # Percentages are compared against these thresholds exactly, with no
 # epsilon tolerance: a value genuinely below a threshold stays below it.
+#
+# These constants describe the *default* (legacy) grading policy.  They are
+# kept for backwards compatibility; new code should read the thresholds from
+# a :class:`grade_tracker.policies.Policy` instead.
 GRADE_THRESHOLDS = ((90, "A"), (80, "B"), (70, "C"), (60, "D"))
 
 
@@ -143,27 +149,36 @@ def percentage(score, max_score):
     return Decimal(str(score)) / Decimal(str(max_score)) * 100
 
 
-def letter_grade(score, max_score=100):
+def letter_grade(score, max_score=100, policy=None):
     """Determines the letter grade corresponding to a score and max_score.
 
     Classification uses the unrounded percentage (see :func:`percentage`),
-    never a rounded display percentage, and compares against the existing
+    never a rounded display percentage, and compares against the policy's
     thresholds exactly — no epsilon tolerance is applied, so a value
     genuinely below a threshold keeps the lower grade.
+
+    ``policy`` selects the grading policy to use (a
+    :class:`grade_tracker.policies.Policy`, an ``"identifier@version"``
+    string, an ``(identifier, version)`` tuple, or ``None`` for the default
+    legacy policy).
     """
     if max_score <= 0:
         raise ValueError("max_score must be greater than 0")
 
+    policy = resolve_policy(policy)
     pct = percentage(score, max_score)
 
-    for threshold, grade in GRADE_THRESHOLDS:
-        if pct >= threshold:
-            return grade
-    return "F"
+    return policy.letter_for_percentage(pct)
 
 
-def calculate_gpa_breakdown(grades):
+def calculate_gpa_breakdown(grades, policy=None):
     """Calculates GPA breakdown and intermediate values for a pre-filtered list of grades.
+
+    ``policy`` selects the grading policy (a
+    :class:`grade_tracker.policies.Policy`, an ``"identifier@version"``
+    string, an ``(identifier, version)`` tuple, or ``None`` for the default
+    legacy policy).  The policy supplies the letter-grade thresholds, the
+    grade points per letter grade, and the GPA rounding rule.
 
     Processes records in input order:
     1. Evaluates percentage, letter grade, grade points, and credits for each record.
@@ -191,6 +206,8 @@ def calculate_gpa_breakdown(grades):
     total_credits = 0.0
     included_count = 0
 
+    policy = resolve_policy(policy)
+
     for g in grades:
         score = g.get("score")
         max_score = g.get("max_score")
@@ -200,12 +217,12 @@ def calculate_gpa_breakdown(grades):
         # Calculate percentage, letter grade, and grade points
         try:
             pct_val = float(percentage(score, max_score)) if max_score > 0 else 0.0
-            lg = letter_grade(score, max_score)
+            lg = letter_grade(score, max_score, policy=policy)
         except (ValueError, TypeError, KeyError):
             pct_val = 0.0
-            lg = "F"
+            lg = policy.failing_letter
 
-        pts = GRADE_POINTS.get(lg, 0.0)
+        pts = policy.grade_points_for(lg)
         weighted_points = pts * c
 
         if key is not None and key in seen_keys:
@@ -243,22 +260,26 @@ def calculate_gpa_breakdown(grades):
     elif total_credits == 0.0:
         calculated_gpa = 0.0
     else:
-        calculated_gpa = round(total_points / total_credits, 2)
+        calculated_gpa = policy.round_gpa(total_points / total_credits)
 
     return {
         "records": records_breakdown,
         "total_points": total_points,
         "total_credits": total_credits,
         "gpa": calculated_gpa,
+        "policy": policy.name,
     }
 
 
-def sgpa(grades, student_id=None, semester=None):
+def sgpa(grades, student_id=None, semester=None, policy=None):
     """Calculates Semester Grade Point Average on a 10.0 scale.
 
     Each distinct stored assessment in the semester contributes exactly once.
     Exact duplicate rows are collapsed, while same-day assessments with
     different grade data are retained.
+
+    ``policy`` selects the grading policy; ``None`` uses the default legacy
+    policy.
 
     Numerical policy: each grade point is classified from the unrounded
     percentage, weighted grade-point and credit totals are accumulated
@@ -269,10 +290,10 @@ def sgpa(grades, student_id=None, semester=None):
     if semester is not None:
         grades = [g for g in grades if str(g.get("semester", "")) == str(semester)]
 
-    return calculate_gpa_breakdown(grades)["gpa"]
+    return calculate_gpa_breakdown(grades, policy=policy)["gpa"]
 
 
-def cgpa(grades, student_id=None):
+def cgpa(grades, student_id=None, policy=None):
     """Calculates Cumulative Grade Point Average on a 10.0 scale.
 
     Aggregates every distinct assessment across all of the student's
@@ -280,17 +301,23 @@ def cgpa(grades, student_id=None):
     assessment (a legitimate retake) and is kept. Only exact repeated rows
     are collapsed; distinct same-day assessment results are retained.
 
+    ``policy`` selects the grading policy; ``None`` uses the default legacy
+    policy.
+
     Numerical policy: same as :func:`sgpa` — unrounded classification,
     unrounded intermediate totals, final result rounded to 2 decimals.
     """
     if student_id is not None:
         grades = [g for g in grades if g.get("student_id") == student_id]
 
-    return calculate_gpa_breakdown(grades)["gpa"]
+    return calculate_gpa_breakdown(grades, policy=policy)["gpa"]
 
 
-def explain_student_gpa(grades, student_id, semester=None):
+def explain_student_gpa(grades, student_id, semester=None, policy=None):
     """Generates structured GPA explanation for a student.
+
+    ``policy`` selects the grading policy; ``None`` uses the default legacy
+    policy.
 
     Returns a dict explaining:
       - student_id: ID of the student.
@@ -308,6 +335,7 @@ def explain_student_gpa(grades, student_id, semester=None):
             "student_exists": False,
             "semester_found": False,
             "semesters": {},
+            "policy": resolve_policy(policy).name,
             "cgpa": {
                 "records": [],
                 "total_points": 0.0,
@@ -317,7 +345,7 @@ def explain_student_gpa(grades, student_id, semester=None):
         }
 
     # CGPA breakdown uses all student records
-    cgpa_breakdown = calculate_gpa_breakdown(student_records)
+    cgpa_breakdown = calculate_gpa_breakdown(student_records, policy=policy)
 
     # Determine unique semesters preserving order of first appearance or sorted
     all_semesters = sorted(list(set(str(g.get("semester", "")) for g in student_records)))
@@ -333,7 +361,9 @@ def explain_student_gpa(grades, student_id, semester=None):
     semesters_breakdown = {}
     for sem in semesters_to_explain:
         sem_records = [g for g in student_records if str(g.get("semester", "")) == sem]
-        semesters_breakdown[sem] = calculate_gpa_breakdown(sem_records)
+        semesters_breakdown[sem] = calculate_gpa_breakdown(
+            sem_records, policy=policy
+        )
 
     return {
         "student_id": student_id,
@@ -341,6 +371,7 @@ def explain_student_gpa(grades, student_id, semester=None):
         "student_exists": True,
         "semester_found": semester_found,
         "semesters": semesters_breakdown,
+        "policy": resolve_policy(policy).name,
         "cgpa": cgpa_breakdown,
     }
 
@@ -368,11 +399,17 @@ def subject_average(grades, subject):
     return round(float(sum(percentages) / len(percentages)), 2)
 
 
-def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
+def calculate_target_sgpa(
+    grades, student_id, target_cgpa, upcoming_credits, policy=None
+):
     """Calculates required SGPA in upcoming credits to achieve a target CGPA.
 
     Derives the required performance using exact unrounded point totals:
         Required SGPA = (Target CGPA * (Current Credits + Upcoming Credits) - Current Points) / Upcoming Credits
+
+    ``policy`` selects the grading policy; ``None`` uses the default legacy
+    policy.  The maximum grade points of the policy define the perfect
+    score used for the achievability check.
 
     Parameters:
         grades: List of grade dicts.
@@ -399,6 +436,10 @@ def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
     if not math.isfinite(upcoming_credits) or upcoming_credits <= 0.0:
         raise ValueError("upcoming_credits must be a finite number greater than 0")
 
+    policy = resolve_policy(policy)
+    max_grade_points = max(policy.grade_points.values()) if policy.grade_points else 10.0
+    scale_max = max_grade_points
+
     student_records = [g for g in grades if g.get("student_id") == student_id]
     if not student_records:
         return {
@@ -412,10 +453,11 @@ def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
             "total_future_credits": round(float(upcoming_credits), 2),
             "required_sgpa": round(float(target_cgpa), 2),
             "is_achievable": True,
-            "max_possible_cgpa": 10.0,
+            "max_possible_cgpa": scale_max,
+            "policy": policy.name,
         }
 
-    breakdown = calculate_gpa_breakdown(student_records)
+    breakdown = calculate_gpa_breakdown(student_records, policy=policy)
     current_credits = breakdown["total_credits"]
     current_points = breakdown["total_points"]
     current_cgpa = breakdown["gpa"]
@@ -434,25 +476,26 @@ def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
             "total_future_credits": round(float(total_future_credits), 2),
             "required_sgpa": round(float(target_cgpa), 2),
             "is_achievable": True,
-            "max_possible_cgpa": 10.0,
+            "max_possible_cgpa": scale_max,
+            "policy": policy.name,
         }
 
     target_total_points = target_cgpa * total_future_credits
     needed_points = target_total_points - current_points
     raw_required_sgpa = needed_points / upcoming_credits
 
-    max_possible_points = current_points + (10.0 * upcoming_credits)
-    max_possible_cgpa = round(max_possible_points / total_future_credits, 2)
+    max_possible_points = current_points + (scale_max * upcoming_credits)
+    max_possible_cgpa = policy.round_gpa(max_possible_points / total_future_credits)
 
-    if raw_required_sgpa > 10.0:
+    if raw_required_sgpa > scale_max:
         is_achievable = False
-        required_sgpa = round(raw_required_sgpa, 2)
+        required_sgpa = policy.round_gpa(raw_required_sgpa)
     elif raw_required_sgpa <= 0.0:
         is_achievable = True
         required_sgpa = 0.0
     else:
         is_achievable = True
-        required_sgpa = round(raw_required_sgpa, 2)
+        required_sgpa = policy.round_gpa(raw_required_sgpa)
 
     return {
         "student_id": student_id,
@@ -466,5 +509,6 @@ def calculate_target_sgpa(grades, student_id, target_cgpa, upcoming_credits):
         "required_sgpa": required_sgpa,
         "is_achievable": is_achievable,
         "max_possible_cgpa": max_possible_cgpa,
+        "policy": policy.name,
     }
 

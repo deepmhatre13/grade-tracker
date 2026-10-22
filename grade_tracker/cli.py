@@ -27,6 +27,11 @@ from grade_tracker.calc import (
     validate_grade,
 )
 from grade_tracker.export import build_html
+from grade_tracker.policies import (
+    UnknownPolicyError,
+    get_default_registry,
+    resolve_policy,
+)
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "grades.csv"
 BACKUP_FORMAT_VERSION = "1.0"
@@ -150,7 +155,7 @@ def _load_grades_for_json(csv_path, command):
     return grades
 
 
-def _grade_json_record(grade, semester=None):
+def _grade_json_record(grade, semester=None, policy=None):
     """Serialize one loaded grade record with stable field names and types."""
     semester_value = grade["semester"] if semester is None else semester
     return {
@@ -164,7 +169,9 @@ def _grade_json_record(grade, semester=None):
         "percentage": round(float(percentage(grade["score"], grade["max_score"])), 1)
         if grade["max_score"] > 0
         else None,
-        "letter_grade": letter_grade(grade["score"], grade["max_score"])
+        "letter_grade": letter_grade(
+            grade["score"], grade["max_score"], policy=policy
+        )
         if grade["max_score"] > 0
         else None,
     }
@@ -1513,6 +1520,15 @@ def cmd_import(args):
 
 
 def cmd_list(args):
+    try:
+        policy = _resolve_policy_argument(args)
+    except UnknownPolicyError as exc:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(_policy_error_payload("list", exc))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
     if _format_name(args) == JSON_FORMAT:
         try:
             grades = _load_grades_for_json(args.data, "list")
@@ -1526,7 +1542,8 @@ def cmd_list(args):
             {
                 "command": "list",
                 "count": len(grades),
-                "grades": [_grade_json_record(g) for g in grades],
+                "policy": resolve_policy(policy).name,
+                "grades": [_grade_json_record(g, policy=policy) for g in grades],
             }
         )
         return
@@ -1539,11 +1556,24 @@ def cmd_list(args):
     print(f"{'Student ID':<12} {'Subject':<20} {'Score':<10} {'Max':<8} {'Grade':<6} {'Date':<12}")
     print("-" * 72)
     for g in grades:
-        lg = letter_grade(g["score"], g["max_score"])
+        lg = letter_grade(g["score"], g["max_score"], policy=policy)
         print(f"{g['student_id']:<12} {g['subject']:<20} {g['score']:<10.1f} {g['max_score']:<8.1f} {lg:<6} {g['date']:<12}")
 
 
 def cmd_summary(args):
+    try:
+        policy = _resolve_policy_argument(args)
+    except UnknownPolicyError as exc:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                _policy_error_payload(
+                    "summary", exc, student_id=args.student_id
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
     if _format_name(args) == JSON_FORMAT:
         try:
             grades = _load_grades_for_json(args.data, "summary")
@@ -1566,6 +1596,7 @@ def cmd_summary(args):
                     "cgpa": None,
                     "semesters": [],
                     "grades": [],
+                    "policy": resolve_policy(policy).name,
                 }
             )
             return
@@ -1576,13 +1607,14 @@ def cmd_summary(args):
                 "command": "summary",
                 "student_id": args.student_id,
                 "count": len(student_grades),
-                "cgpa": cgpa(grades, args.student_id),
+                "cgpa": cgpa(grades, args.student_id, policy=policy),
+                "policy": resolve_policy(policy).name,
                 "semesters": [
                     {
                         "semester": sem,
-                        "sgpa": sgpa(grades, args.student_id, sem),
+                        "sgpa": sgpa(grades, args.student_id, sem, policy=policy),
                         "grades": [
-                            _grade_json_record(g, str(sem))
+                            _grade_json_record(g, str(sem), policy=policy)
                             for g in student_grades
                             if g["semester"] == sem
                         ],
@@ -1590,7 +1622,8 @@ def cmd_summary(args):
                     for sem in semesters
                 ],
                 "grades": [
-                    _grade_json_record(g) for g in student_grades
+                    _grade_json_record(g, policy=policy)
+                    for g in student_grades
                 ],
             }
         )
@@ -1602,18 +1635,19 @@ def cmd_summary(args):
         print(f"No records found for student '{args.student_id}'.")
         return
 
-    student_cgpa = cgpa(grades, args.student_id)
+    student_cgpa = cgpa(grades, args.student_id, policy=policy)
     print(f"Summary for Student: {args.student_id}")
+    print(f"Policy: {resolve_policy(policy).name}")
     print(f"CGPA: {student_cgpa}")
     print("-" * 50)
 
     semesters = sorted(list(set(g["semester"] for g in student_grades)))
     for sem in semesters:
         sem_grades = [g for g in student_grades if g["semester"] == sem]
-        sem_sgpa = sgpa(grades, args.student_id, sem)
+        sem_sgpa = sgpa(grades, args.student_id, sem, policy=policy)
         print(f"Semester {sem} (SGPA: {sem_sgpa})")
         for g in sem_grades:
-            lg = letter_grade(g["score"], g["max_score"])
+            lg = letter_grade(g["score"], g["max_score"], policy=policy)
             # Display-only rounding (1 decimal); the grade above is decided
             # from the unrounded percentage, never from this value.
             pct = float(percentage(g["score"], g["max_score"])) if g["max_score"] > 0 else 0
@@ -1623,6 +1657,22 @@ def cmd_summary(args):
 def cmd_explain(args):
     """Explain GPA calculation breakdown for a student."""
     requested_sem = args.semester
+
+    try:
+        policy = _resolve_policy_argument(args)
+    except UnknownPolicyError as exc:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                _policy_error_payload(
+                    "explain",
+                    exc,
+                    student_id=args.student_id,
+                    semester=requested_sem,
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
     if _format_name(args) == JSON_FORMAT:
         try:
@@ -1635,7 +1685,9 @@ def cmd_explain(args):
             _emit_json(payload)
             raise SystemExit(2) from exc
 
-        explanation = explain_student_gpa(grades, args.student_id, semester=requested_sem)
+        explanation = explain_student_gpa(
+            grades, args.student_id, semester=requested_sem, policy=policy
+        )
         if not explanation["student_exists"]:
             _emit_json(
                 {
@@ -1644,6 +1696,7 @@ def cmd_explain(args):
                     "semester": requested_sem,
                     "student_exists": False,
                     "semester_found": False,
+                    "policy": resolve_policy(policy).name,
                     "cgpa": {
                         "numerator": 0.0,
                         "denominator": 0.0,
@@ -1662,6 +1715,7 @@ def cmd_explain(args):
                     "semester": requested_sem,
                     "student_exists": True,
                     "semester_found": False,
+                    "policy": resolve_policy(policy).name,
                     "cgpa": {
                         "numerator": explanation["cgpa"]["total_points"],
                         "denominator": explanation["cgpa"]["total_credits"],
@@ -1710,6 +1764,7 @@ def cmd_explain(args):
                 "semester": requested_sem,
                 "student_exists": True,
                 "semester_found": explanation["semester_found"],
+                "policy": resolve_policy(policy).name,
                 "cgpa": {
                     "numerator": explanation["cgpa"]["total_points"],
                     "denominator": explanation["cgpa"]["total_credits"],
@@ -1726,12 +1781,15 @@ def cmd_explain(args):
         print(f"Error: student '{args.student_id}' does not exist.", file=sys.stderr)
         raise SystemExit(1)
 
-    explanation = explain_student_gpa(grades, args.student_id, semester=requested_sem)
+    explanation = explain_student_gpa(
+        grades, args.student_id, semester=requested_sem, policy=policy
+    )
     if requested_sem is not None and not explanation["semester_found"]:
         print(f"No records found for student '{args.student_id}' in semester {requested_sem}.")
         return
 
     print(f"Explanation for Student: {args.student_id}")
+    print(f"Policy: {resolve_policy(policy).name}")
     if requested_sem is not None:
         print(f"Filtered Semester: {requested_sem}")
     print("=" * 60)
@@ -1776,6 +1834,19 @@ def cmd_target_gpa(args):
     """Calculate required SGPA in upcoming credits to achieve a target CGPA."""
     target_cgpa = args.target
     upcoming_credits = args.credits
+
+    try:
+        policy = _resolve_policy_argument(args)
+    except UnknownPolicyError as exc:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                _policy_error_payload(
+                    "target-gpa", exc, student_id=args.student_id
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
     # Validate target and credits bounds
     if not (0.0 <= target_cgpa <= 10.0):
@@ -1834,7 +1905,9 @@ def cmd_target_gpa(args):
             )
             raise SystemExit(1)
 
-        res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+        res = calculate_target_sgpa(
+            grades, args.student_id, target_cgpa, upcoming_credits, policy=policy
+        )
         _emit_json(
             {
                 "command": "target-gpa",
@@ -1847,6 +1920,7 @@ def cmd_target_gpa(args):
                 "required_sgpa": res["required_sgpa"],
                 "is_achievable": res["is_achievable"],
                 "max_possible_cgpa": res["max_possible_cgpa"],
+                "policy": resolve_policy(policy).name,
             }
         )
         return
@@ -1857,9 +1931,12 @@ def cmd_target_gpa(args):
         print(f"Error: student '{args.student_id}' does not exist.", file=sys.stderr)
         raise SystemExit(1)
 
-    res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+    res = calculate_target_sgpa(
+        grades, args.student_id, target_cgpa, upcoming_credits, policy=policy
+    )
     curr_cgpa_str = f"{res['current_cgpa']:.2f}" if res["current_cgpa"] is not None else "N/A"
     print(f"Student: {res['student_id']}")
+    print(f"Policy: {resolve_policy(policy).name}")
     print(f"Current CGPA: {curr_cgpa_str} (over {res['current_credits']:.1f} credits)")
     print(f"Target CGPA:  {res['target_cgpa']:.2f}")
     print(f"Upcoming:     {res['upcoming_credits']:.1f} credits")
@@ -1908,9 +1985,46 @@ def cmd_average(args):
         print(f"Average for '{args.subject}': {avg}")
 
 
+def cmd_policies(args):
+    """List the registered grading policies."""
+    registry = get_default_registry()
+    policies = registry.all()
+    default_name = resolve_policy(None).name
+
+    if _format_name(args) == JSON_FORMAT:
+        _emit_json(
+            {
+                "command": "policies",
+                "default": default_name,
+                "policies": [policy.to_dict() for policy in policies],
+            }
+        )
+        return
+
+    print("Registered grading policies:")
+    for policy in policies:
+        marker = " (default)" if policy.name == default_name else ""
+        print(f"  {policy.name}{marker}")
+        if policy.description:
+            print(f"      {policy.description}")
+        thresholds = ", ".join(
+            f"{letter}>={percentage:g}" for percentage, letter in policy.thresholds
+        )
+        print(f"      thresholds: {thresholds}; failing grade: {policy.failing_letter}")
+        points = ", ".join(
+            f"{letter}={value:g}" for letter, value in sorted(policy.grade_points.items())
+        )
+        print(f"      grade points: {points}")
+
+
 def cmd_export(args):
+    try:
+        policy = _resolve_policy_argument(args)
+    except UnknownPolicyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     grades = load_grades(args.data)
-    output_file = build_html(grades, args.output)
+    output_file = build_html(grades, args.output, policy=policy)
     print(f"HTML report successfully exported to: {output_file}")
 
 
@@ -2009,6 +2123,48 @@ def cmd_delete(args):
         else:
             print(f"Successfully deleted {count} {noun}.")
 
+
+
+def _add_policy_argument(parser):
+    """Add the shared ``--policy`` option to a command parser.
+
+    The value is a policy name: either a bare identifier (which resolves to
+    the highest registered version) or ``identifier@version`` for an exact
+    version.  Omitting the option uses the default legacy policy.
+    """
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help=(
+            "Grading policy to apply, as 'identifier' or 'identifier@version' "
+            "(default: legacy@1)"
+        ),
+    )
+
+
+def _resolve_policy_argument(args):
+    """Resolve the ``--policy`` option of ``args`` into a Policy.
+
+    Returns ``None`` when no policy was requested, so callers can keep using
+    the default policy without an extra lookup.
+    """
+    requested = getattr(args, "policy", None)
+    if not requested:
+        return None
+    return resolve_policy(requested)
+
+
+def _policy_error_payload(command, exc, **extra):
+    """Build a JSON-ready payload describing a policy selection error."""
+    payload = {
+        "command": command,
+        "error": {
+            "code": "unknown_policy",
+            "message": str(exc),
+        },
+    }
+    payload.update(extra)
+    return payload
 
 
 def _add_format_argument(parser):
@@ -2338,12 +2494,14 @@ def main():
     # list
     p_list = subparsers.add_parser("list", help="List all grades")
     _add_format_argument(p_list)
+    _add_policy_argument(p_list)
     p_list.set_defaults(func=cmd_list)
 
     # summary
     p_summary = subparsers.add_parser("summary", help="Show summary for a student")
     p_summary.add_argument("student_id", help="Student ID")
     _add_format_argument(p_summary)
+    _add_policy_argument(p_summary)
     p_summary.set_defaults(func=cmd_summary)
 
     # explain
@@ -2351,6 +2509,7 @@ def main():
     p_explain.add_argument("student_id", help="Student ID")
     p_explain.add_argument("--semester", default=None, help="Filter by semester")
     _add_format_argument(p_explain)
+    _add_policy_argument(p_explain)
     p_explain.set_defaults(func=cmd_explain)
 
     # target-gpa
@@ -2366,7 +2525,15 @@ def main():
         dest="format",
         help="Output JSON (shorthand for --format json)",
     )
+    _add_policy_argument(p_target)
     p_target.set_defaults(func=cmd_target_gpa)
+
+    # policies
+    p_policies = subparsers.add_parser(
+        "policies", help="List the registered grading policies"
+    )
+    _add_format_argument(p_policies)
+    p_policies.set_defaults(func=cmd_policies)
 
     # average
     p_avg = subparsers.add_parser("average", help="Show average for a subject")
@@ -2377,6 +2544,7 @@ def main():
     # export
     p_export = subparsers.add_parser("export", help="Export HTML report")
     p_export.add_argument("--output", default="reports/index.html", help="Output file path")
+    _add_policy_argument(p_export)
     p_export.set_defaults(func=cmd_export)
 
     # add
