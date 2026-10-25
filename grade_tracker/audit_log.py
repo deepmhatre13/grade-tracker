@@ -49,7 +49,7 @@ SUPPORTED_SCHEMA_VERSIONS = ("1.0",)
 GENESIS_PREV_HASH = "0" * 64
 
 #: Operation types recorded in the audit log.
-OPERATIONS = ("add", "edit", "import", "delete", "restore", "migrate")
+OPERATIONS = ("add", "edit", "import", "delete", "restore", "migrate", "rollback")
 
 #: Explicit, documented field order used for canonical serialization.
 #: The ``hash`` field is excluded from the hashed payload.

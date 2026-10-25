@@ -35,6 +35,7 @@ On Windows, use `python` instead of `python3`.
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
+| `rollback <event_id> [--dry-run] [--yes] [--reason TEXT]` | Safely reverses a previous mutation (add, edit, delete, or import) by creating a compensating audit transaction |
 
 
 
@@ -84,6 +85,19 @@ repeated rows are still rejected and counted only once.
 - Temporary files are cleaned up on any failure, leaving the original destination byte-for-byte unchanged.
 - If the destination does not yet exist, its directory structure is created and the file is safely established.
 - Concurrency & atomicity limitations: Advisory locks protect coordinating processes using this CLI. Durability is bounded by the underlying OS filesystem guarantees.
+
+`rollback <event_id>` reverses a previous grade mutation safely by creating a new compensating transaction:
+- **Compensating Mutation**: Rollback does not erase history, rewrite historical audit events, or blindly overwrite the dataset with an old CSV snapshot. Instead, it computes and applies the exact inverse of the target mutation and appends a new `rollback` audit event referencing the original `event_id`.
+- **Supported Operations**:
+  - `add`: Removes the added record, provided it still exists in the dataset matching the state produced by the original addition.
+  - `edit`: Restores the record's prior values (`before`), provided the record currently in the dataset still matches the state produced by the edit (`after`). Restoring values is rejected if it would duplicate another record.
+  - `delete`: Restores the deleted records to the dataset, provided their assessment identities are not already occupied and they pass grade validation.
+  - `import`: Removes the imported records from the dataset, ensuring each still matches its imported values and preserving unrelated records.
+- **Unsupported Operations**: Operations such as `migrate` or `restore` cannot be rolled back because their audit events do not contain granular per-record inversion history. Events lacking complete before-and-after change history are rejected.
+- **Conflict Safeguards**: Rollback inspects the latest dataset under the dataset's advisory inter-process lock. If an affected record was modified, replaced, or deleted by a subsequent operation, or if restoring an assessment would introduce a duplicate identity, rollback rejects the operation with exit code 2 and leaves the dataset byte-for-byte unchanged.
+- **Duplicate Rollback Prevention**: An audit mutation event can only be rolled back once. Every rollback event persists a durable reference (`rolled_back_event_id`) in its audit changes payload. Attempting to roll back an already-reversed mutation is detected and rejected.
+- **Dry-Run & Confirmation**: Destructive rollback requires explicit confirmation via `--yes` (`-y`). Running with `--dry-run` previews the operation type and affected records without modifying the CSV or writing audit events.
+- **Transaction & Crash Durability**: The rollback runs as a single `AuditTransaction` under the inter-process lock. The proposed dataset is validated in its entirety before atomic replacement (`os.replace`), and crash recovery via the pending journal (`recover_pending`) guarantees consistency without duplicate rollback events.
 
 ## How it's supposed to work
 
@@ -266,6 +280,7 @@ Malformed CSV input is never converted into a successful empty JSON result for `
 - `grade_tracker/calc.py`: letter grades, GPA, averages
 - `grade_tracker/audit_log.py`: versioned audit event schema, canonical serialization, and SHA-256 hash-chain verification
 - `grade_tracker/audit_txn.py`: crash-recoverable write-ahead transaction journal coordinating CSV mutations and audit logs
+- `grade_tracker/rollback.py`: conflict checking, record inversion, and compensating rollback transactions
 - `grade_tracker/cli.py`: the commands, and reading and writing the CSV
 - `grade_tracker/export.py`: the HTML report
 - `tests/`: tests, run with `python3 -m unittest discover tests`
@@ -287,7 +302,7 @@ Audit records follow schema version `1.0` (`AUDIT_SCHEMA_VERSION = "1.0"`). Ever
 1. `schema_version`: Audit format version (`"1.0"`).
 2. `event_id`: Unique UUID4 identifier (`str(uuid.uuid4())`).
 3. `sequence`: Strictly increasing 1-based integer sequence (`1, 2, 3, ...`).
-4. `operation`: Operation name (`add`, `edit`, `import`, `delete`, `restore`, or `migrate`).
+4. `operation`: Operation name (`add`, `edit`, `import`, `delete`, `restore`, `migrate`, or `rollback`).
 5. `timestamp`: UTC ISO 8601 timestamp with microsecond resolution (`YYYY-MM-DDTHH:MM:SS.ffffffZ`).
 6. `dataset_id`: Stable identifier of the target CSV file.
 7. `records`: List of affected academic records (each specifying `student_id`, `semester`, `subject`, `date`, `score`, `max_score`, `credits`).

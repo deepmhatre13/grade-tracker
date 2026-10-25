@@ -39,6 +39,12 @@ from grade_tracker.audit_txn import (
     AuditTransactionError,
     recover_pending,
 )
+from grade_tracker.rollback import (
+    RollbackError,
+    RollbackIntegrityError,
+    RollbackConflictError,
+    rollback_mutation,
+)
 from grade_tracker.export import build_html
 from grade_tracker.policies import (
     UnknownPolicyError,
@@ -2579,6 +2585,40 @@ def cmd_restore(args):
     raise SystemExit(0)
 
 
+def cmd_rollback(args):
+    """Roll back a previous grade mutation identified by its audit event ID."""
+    try:
+        result = rollback_mutation(
+            csv_path=args.data,
+            event_id=args.event_id,
+            dry_run=args.dry_run,
+            confirmed=args.yes,
+            reason=getattr(args, "reason", None),
+        )
+    except (RollbackError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    count = result["records_affected"]
+    noun = "record" if count == 1 else "records"
+    op = result["operation"]
+    event_id = result["event_id"]
+    records = result.get("records", [])
+
+    if result.get("dry_run"):
+        print(f"Dry run: rollback of {op} mutation (event {event_id}) would affect {count} {noun}:")
+        for r in records:
+            score_str = f"{float(r.get('score', 0)):.1f}/{float(r.get('max_score', 0)):.1f}"
+            date_str = r.get("date") or "-"
+            print(
+                f"  {r.get('student_id', ''):<10} {r.get('subject', ''):<18} "
+                f"Sem: {r.get('semester', '1'):<4} Date: {date_str:<12} Score: {score_str}"
+            )
+        print("No changes were made.")
+    else:
+        print(f"Successfully rolled back {op} mutation (event {event_id}): {count} {noun} affected.")
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
@@ -2796,6 +2836,33 @@ def main():
     )
     p_restore.add_argument("backup_path", help="Path to backup CSV or JSON manifest")
     p_restore.set_defaults(func=cmd_restore)
+
+    # rollback
+    p_rollback = subparsers.add_parser(
+        "rollback",
+        help="Safely roll back a previous grade mutation using audit history",
+        description=(
+            "Safely roll back a previous mutation (add, edit, delete, or import) "
+            "identified by its audit EVENT_ID. Operates under an inter-process lock, "
+            "validates the audit chain, checks for conflicts against current records, "
+            "and writes a compensating audit transaction. Use --dry-run to preview "
+            "the rollback without making changes; pass --yes to confirm execution."
+        ),
+    )
+    p_rollback.add_argument("event_id", help="Audit event ID (UUID) of the mutation to reverse")
+    p_rollback.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Preview the rollback operation without modifying data or audit log",
+    )
+    p_rollback.add_argument(
+        "--yes", "-y", action="store_true", default=False,
+        help="Confirm execution of the rollback mutation",
+    )
+    p_rollback.add_argument(
+        "--reason", default=None,
+        help="Optional reason describing the rollback mutation",
+    )
+    p_rollback.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args()
     if not args.command:
