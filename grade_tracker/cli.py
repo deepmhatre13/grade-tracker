@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import io
 import json
 import math
 import os
@@ -25,6 +26,18 @@ from grade_tracker.calc import (
     sgpa,
     subject_average,
     validate_grade,
+)
+from grade_tracker.audit_log import (
+    OPERATIONS as AUDIT_OPERATIONS,
+    audit_log_path_for,
+    dataset_id_for,
+    filter_events,
+    verify_log,
+)
+from grade_tracker.audit_txn import (
+    AuditTransaction,
+    AuditTransactionError,
+    recover_pending,
 )
 from grade_tracker.export import build_html
 from grade_tracker.policies import (
@@ -442,30 +455,41 @@ def _read_existing_rows(path):
         return True, list(reader)
 
 
-def _atomic_write_rows(path, rows):
-    """Write ``rows`` (data records, no header) to ``path`` atomically.
+def _csv_rows_bytes(rows):
+    """Return the exact CSV bytes for ``rows`` (data records, no header).
+
+    The encoding matches :func:`_atomic_write_rows` byte-for-byte, so a
+    transaction can compute the post-commit digest of the dataset before it
+    replaces the file.
+    """
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["student_id", "subject", "score", "max_score", "date", "credits", "semester"]
+    )
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _atomic_write_bytes(path, data):
+    """Replace ``path`` with ``data`` atomically.
 
     Writes to a temporary file in the same directory, flushes and ``fsync``\\ s
-    it, then ``os.replace``\\ s it over the target.  On any failure before the
-    replace succeeds the original file is left byte-for-byte unchanged and the
-    temporary file is removed.  Callers must hold the inter-process lock.
+    it, then ``os.replace``\\ s it over the target.  On any failure before
+    the replace succeeds the original file is left byte-for-byte unchanged
+    and the temporary file is removed.
     """
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=".grades-", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["student_id", "subject", "score", "max_score", "date", "credits", "semester"]
-            )
-            for row in rows:
-                writer.writerow(row)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
-
-        # Atomically replace the target CSV.
         os.replace(tmp_name, path)
         tmp_name = None
     finally:
@@ -476,17 +500,79 @@ def _atomic_write_rows(path, rows):
                 pass
 
 
-def _append_row(path, row):
+def _atomic_write_rows(path, rows):
+    """Write ``rows`` (data records, no header) to ``path`` atomically.
+
+    Writes to a temporary file in the same directory, flushes and ``fsync``\\ s
+    it, then ``os.replace``\\ s it over the target.  On any failure before the
+    replace succeeds the original file is left byte-for-byte unchanged and the
+    temporary file is removed.  Callers must hold the inter-process lock.
+    """
+    _atomic_write_bytes(path, _csv_rows_bytes(rows))
+
+
+def _audit_record(
+    student_id, subject, score, max_score, date, credits, semester
+):
+    """Return the audit representation of one grade record.
+
+    The audit log stores the academic identity and result of a record, not
+    the raw CSV row, so history entries stay stable and readable.
+    """
+    return {
+        "student_id": str(student_id),
+        "semester": str(semester),
+        "subject": str(subject),
+        "date": str(date),
+        "score": str(score),
+        "max_score": str(max_score),
+        "credits": str(credits),
+    }
+
+
+def _audit_record_from_row(row):
+    """Return the audit representation of one raw CSV row."""
+    header = [
+        "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+    ]
+    values = dict(zip(header, list(row) + [""] * len(header)))
+    return _audit_record(
+        values["student_id"], values["subject"], values["score"],
+        values["max_score"], values["date"], values["credits"], values["semester"],
+    )
+
+
+def _append_row(path, row, operation=None, records=None, changes=None,
+                reason=None, actor=None):
     """Append one raw CSV row to ``path`` using atomic persistence.
 
     Shared by ``save_grade`` and ``edit_grade``; both callers must already
     hold the inter-process lock for ``path``.  The file is created (with the
     canonical header) if it does not exist.
+
+    When ``operation`` is given the write is performed through
+    :class:`~grade_tracker.audit_txn.AuditTransaction`, so the grade change
+    and its audit event are committed as one recoverable logical
+    transaction.  The lock is already held by the caller, so the
+    transaction does not acquire it a second time.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _, existing_rows = _read_existing_rows(path)
-    _atomic_write_rows(path, list(existing_rows) + [row])
+    new_rows = list(existing_rows) + [row]
+    if operation is None:
+        _atomic_write_rows(path, new_rows)
+        return
+    with AuditTransaction(
+        path,
+        operation=operation,
+        records=records or [],
+        changes=changes or {},
+        reason=reason,
+        actor=actor,
+        manage_lock=False,
+    ) as txn:
+        txn.write_dataset(new_rows)
 
 
 def save_grade(
@@ -528,7 +614,6 @@ def save_grade(
     with _InterProcessLock(lock_file) as _lock:
         # Read the latest persisted records while holding the lock.
         existing = load_grades(csv_path)
-
         # Duplicate detection is performed under the lock.  The identity is
         # derived from the authoritative calc.assessment_key so that the
         # persistence layer can never drift from the calculation layer.
@@ -555,10 +640,19 @@ def save_grade(
 
         # Build the updated CSV contents and write atomically.  ``_append_row``
         # performs the schema check and the temp-file/fsync/replace sequence
-        # while this transaction still holds the lock.
+        # while this transaction still holds the lock.  The write goes
+        # through ``AuditTransaction`` so the grade change and its audit
+        # event are committed as one recoverable logical transaction.
         _append_row(
             csv_path,
             [student_id, subject, score, max_score, date, credits, semester],
+            operation="add",
+            records=[_audit_record(
+                student_id, subject, score, max_score, date, credits, semester
+            )],
+            changes={"before": None, "after": _audit_record(
+                student_id, subject, score, max_score, date, credits, semester
+            )},
         )
 
 

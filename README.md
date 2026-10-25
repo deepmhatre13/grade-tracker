@@ -264,9 +264,93 @@ Malformed CSV input is never converted into a successful empty JSON result for `
 ## Code
 
 - `grade_tracker/calc.py`: letter grades, GPA, averages
+- `grade_tracker/audit_log.py`: versioned audit event schema, canonical serialization, and SHA-256 hash-chain verification
+- `grade_tracker/audit_txn.py`: crash-recoverable write-ahead transaction journal coordinating CSV mutations and audit logs
 - `grade_tracker/cli.py`: the commands, and reading and writing the CSV
 - `grade_tracker/export.py`: the HTML report
 - `tests/`: tests, run with `python3 -m unittest discover tests`
+
+## Tamper-evident audit history
+
+Grade mutations (`add`, `edit`, `delete`) record an immutable, tamper-evident audit history alongside the grade data.
+
+### Storage and naming
+
+- **Audit log**: Stored adjacent to the data CSV as `<csv_stem>.audit.jsonl` (e.g. `data/grades.audit.jsonl`), derived via `audit_log_path_for(csv_path)`. Each committed mutation appends exactly one JSON object line (JSON Lines format).
+- **Pending journal**: Stored as `<csv_stem>.audit-pending.json` (e.g. `data/grades.audit-pending.json`), derived via `pending_journal_path_for(csv_path)`. This temporary write-ahead journal coordinates two-phase crash recovery and is cleared upon successful commit.
+- **Dataset identifier**: Every event records a `dataset_id` string formatted as `grades:<sha256[:16]>`, deterministically derived from the resolved absolute CSV path via `dataset_id_for(csv_path)`.
+
+### Event schema and SHA-256 hash chain
+
+Audit records follow schema version `1.0` (`AUDIT_SCHEMA_VERSION = "1.0"`). Every event contains twelve standardized fields:
+
+1. `schema_version`: Audit format version (`"1.0"`).
+2. `event_id`: Unique UUID4 identifier (`str(uuid.uuid4())`).
+3. `sequence`: Strictly increasing 1-based integer sequence (`1, 2, 3, ...`).
+4. `operation`: Operation name (`add`, `edit`, `import`, `delete`, `restore`, or `migrate`).
+5. `timestamp`: UTC ISO 8601 timestamp with microsecond resolution (`YYYY-MM-DDTHH:MM:SS.ffffffZ`).
+6. `dataset_id`: Stable identifier of the target CSV file.
+7. `records`: List of affected academic records (each specifying `student_id`, `semester`, `subject`, `date`, `score`, `max_score`, `credits`).
+8. `changes`: Mapping with `"before"` and `"after"` representations of the modified record(s).
+9. `actor`: Identity of the mutating actor, or `null`.
+10. `reason`: Free-form description of the mutation, or `null`.
+11. `previous_hash`: SHA-256 digest of the immediately preceding event. For the initial (genesis) event at sequence 1, `previous_hash` is 64 hex zeros (`"0" * 64`).
+12. `hash`: SHA-256 digest of this event.
+
+#### Canonical serialization & verification
+
+- To prevent hash ambiguity from dictionary key ordering or whitespace, `canonical_bytes(event)` extracts the eleven hashed fields (all fields except `hash`) in the strict order defined by `EVENT_FIELD_ORDER`.
+- Nested dictionaries (such as `changes` or records) are serialized with `sort_keys=True` and compact separators (`,`, `:`).
+- The SHA-256 digest over these canonical UTF-8 bytes forms the event's `hash`.
+- `verify_log(log_path)` walks the chain from genesis to head and detects:
+  - `invalid_event` / `hash_mismatch`: Event payload does not match its computed SHA-256 hash.
+  - `broken_link`: An event's `previous_hash` does not match the preceding event's `hash`.
+  - `sequence_gap` / `duplicate_sequence`: Sequence numbers fail to start at 1 or do not strictly increment by 1.
+  - `duplicate_event_id`: Repeated event UUIDs across the chain.
+  - `dataset_mismatch`: Events referencing different dataset identifiers.
+  - `malformed_entry`: Non-JSON lines, blank lines, or missing mandatory fields.
+  - `unsupported_schema`: Schema versions unrecognized by the verifier.
+
+### Interrupted mutation recovery protocol
+
+Because the grade dataset (`grades.csv`) and the audit log (`grades.audit.jsonl`) are separate files, atomic replacement of both cannot occur simultaneously at the filesystem level. Coordination is achieved via `AuditTransaction` and a write-ahead journal (`grades.audit-pending.json`):
+
+1. **Locking**: The dataset's advisory inter-process lock is acquired.
+2. **Pre-recovery**: Any leftover pending journal is inspected and resolved via `recover_pending(csv_path)` before starting a new mutation.
+3. **Preparation**: The next audit event is constructed and hashed against the current chain head.
+4. **Staging**: The pending journal is written atomically, recording `dataset_sha256_before`, `dataset_sha256_after`, and the prepared audit event.
+5. **Dataset commit**: The new CSV content is written to a temporary file, flushed, `fsync`ed, and atomically replaced (`os.replace`).
+6. **Audit finalization**: The prepared audit event is appended to `grades.audit.jsonl`.
+7. **Cleanup**: The pending journal file is removed.
+
+#### Crash windows & recovery actions
+
+When a crash or process termination occurs mid-transaction:
+
+- **Crash before dataset replace (Step 5)**:
+  - Current CSV SHA-256 matches `dataset_sha256_before`.
+  - Recovery action: Discards the pending journal (`action: "rolled_back"`). The dataset remains in its original state; no false audit event is appended.
+- **Crash between dataset replace and audit finalization (Step 5 to 6)**:
+  - Current CSV SHA-256 matches `dataset_sha256_after`.
+  - Recovery action: Appends the prepared event to the audit log and removes the journal (`action: "committed"`).
+- **Crash between audit finalization and journal removal (Step 6 to 7)**:
+  - Current CSV SHA-256 matches `dataset_sha256_after`, and the event ID is already present in the audit log.
+  - Recovery action: Removes the orphaned journal without appending duplicate events (`action: "already_committed"`).
+- **Ambiguous state**:
+  - Current CSV SHA-256 matches neither `dataset_sha256_before` nor `dataset_sha256_after` (e.g. out-of-band edit or corruption).
+  - Recovery action: Fails closed by raising `AmbiguousTransactionError`. The journal is preserved for manual inspection.
+
+### Retention policy
+
+- Audit logs are strictly append-only.
+- Committed audit events are permanent records; grade deletions (`delete`) record an audit event capturing deleted records rather than truncating historical log entries.
+- The hash chain enforces an unbroken sequence from sequence 1. Truncating or deleting historical events invalidates all subsequent hashes in the chain.
+
+### Tamper-detection limitations
+
+- **Local filesystem boundary**: The hash chain guarantees cryptographic tamper-*evidence*, not access control. An adversary with write permissions to the filesystem could rewrite the entire CSV and regenerate a valid hash chain from sequence 1. External anchoring (such as remote replication, detached signatures, or write-once storage) is required to detect complete history rewrites.
+- **Advisory locking**: Concurrency guarantees rely on cooperative inter-process locks (`_InterProcessLock`). Uncoordinated processes writing directly to `grades.csv` bypass transactional journaling.
+- **Storage durability**: Crash recovery relies on filesystem barrier semantics and `os.fsync`. Hardware-level write cache failures can compromise un-flushed disk blocks.
 
 ## Contributing
 
