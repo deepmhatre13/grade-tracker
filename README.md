@@ -36,6 +36,10 @@ On Windows, use `python` instead of `python3`.
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
 | `restore <backup_path>` | Verifies and restores a backup to the grade data file |
 | `rollback <event_id> [--dry-run] [--yes] [--reason TEXT]` | Safely reverses a previous mutation (add, edit, delete, or import) by creating a compensating audit transaction |
+| `snapshot create <sgpa\|cgpa> <student_id> [--semester N] [--policy NAME] [--snapshot-id ID] [--description TEXT] [--format json]` | Creates an immutable, reproducible snapshot of a GPA calculation with preserved inputs and policy |
+| `snapshot inspect <snapshot_id> [--format json]` | Inspects snapshot metadata, preserved inputs, calculation results, and SHA-256 digest integrity |
+| `snapshot reproduce <snapshot_id> [--format json]` | Independently recalculates GPA strictly using preserved historical inputs and policy, comparing against the recorded result |
+| `snapshot list [--format json]` | Lists all available GPA calculation snapshots |
 
 
 
@@ -98,6 +102,66 @@ repeated rows are still rejected and counted only once.
 - **Duplicate Rollback Prevention**: An audit mutation event can only be rolled back once. Every rollback event persists a durable reference (`rolled_back_event_id`) in its audit changes payload. Attempting to roll back an already-reversed mutation is detected and rejected.
 - **Dry-Run & Confirmation**: Destructive rollback requires explicit confirmation via `--yes` (`-y`). Running with `--dry-run` previews the operation type and affected records without modifying the CSV or writing audit events.
 - **Transaction & Crash Durability**: The rollback runs as a single `AuditTransaction` under the inter-process lock. The proposed dataset is validated in its entirety before atomic replacement (`os.replace`), and crash recovery via the pending journal (`recover_pending`) guarantees consistency without duplicate rollback events.
+
+## Reproducible GPA calculation snapshots
+
+GPA snapshots preserve exact calculation inputs, policy configurations, algorithm versions, and content integrity digests so historical SGPA and CGPA results can be reproduced deterministically even when current grade records, active grading policies, or future calculation logic change.
+
+```bash
+# Create an SGPA snapshot for a student in semester 1
+python3 -m grade_tracker snapshot create sgpa CS101 --semester 1
+
+# Create a cumulative CGPA snapshot across all semesters
+python3 -m grade_tracker snapshot create cgpa CS101 --snapshot-id cs101-cgpa-y1
+
+# Inspect snapshot metadata, preserved inputs, and digest integrity
+python3 -m grade_tracker snapshot inspect cs101-cgpa-y1
+
+# Reproduce GPA using preserved historical inputs and policy
+python3 -m grade_tracker snapshot reproduce cs101-cgpa-y1
+
+# List all available snapshots
+python3 -m grade_tracker snapshot list
+```
+
+### Guarantees and limitations
+
+- **Deterministic Reproduction**: `snapshot reproduce` strictly uses the snapshot's preserved grade records and frozen policy configuration. It executes the canonical calculation logic (`calculate_gpa_breakdown`) and verifies the recalculated GPA against the recorded result.
+- **Independence from Live Data**: Modifying, deleting, or adding grade records in `data/grades.csv` does not affect snapshot reproduction. The snapshot remains fully reproducible even if the original CSV file is deleted or records are altered.
+- **Independence from Active Policy**: Changing the active grading policy or registering new policies has zero impact on reproduction. The snapshot preserves the complete effective policy configuration (thresholds, grade points, rounding mode, and precision).
+- **Tamper Evidence & Integrity**: Every snapshot records a SHA-256 `content_digest` over canonical JSON bytes (compact separators, sorted keys) excluding the digest field itself. Any manual alteration to preserved grades, GPA results, or policy settings triggers a content digest mismatch error (`SnapshotIntegrityError`).
+- **Version Enforcement**: Snapshots track `schema_version` (`"1.0"`) and calculation `algorithm_version` (`"1.0"`). If an unsupported version is encountered, reproduction fails explicitly with `UnsupportedVersionError` rather than guessing or applying a different algorithm.
+- **Concurrency & Atomic Persistence**: Snapshots are persisted to `data/snapshots/<snapshot_id>.json` using atomic temporary file creation, `fsync`, and atomic rename (`os.replace`) under the dataset's inter-process lock. Silent overwrites of existing snapshot IDs are rejected with `SnapshotExistsError`.
+- **Audit Integration**: Creating a snapshot appends a `snapshot` event to the tamper-evident audit history log (`grades.audit.jsonl`), linking the snapshot ID, calculation type, student ID, and digest.
+
+### Worked example: reproducibility after data and policy changes
+
+1. **Calculate and snapshot original SGPA**:
+   ```bash
+   python3 -m grade_tracker snapshot create sgpa S101 --semester 1 --snapshot-id s101-s1-orig
+   # Output: GPA: 9.43, Policy: legacy@1, Digest: 6ff8a7...
+   ```
+2. **Alter live grades and change active policy**:
+   ```bash
+   # Student's score in Math is subsequently edited or deleted in grades.csv
+   python3 -m grade_tracker edit S101 1 Math 2026-01-15 --score 50
+   # Current calculation now yields a lower GPA:
+   python3 -m grade_tracker summary S101
+   # Output: SGPA: 5.14
+   ```
+3. **Reproduce original historical snapshot**:
+   ```bash
+   python3 -m grade_tracker snapshot reproduce s101-s1-orig
+   # Output:
+   # Reproduced snapshot: s101-s1-orig
+   #   Status:          MATCH (VERIFIED)
+   #   Recorded GPA:    9.43
+   #   Reproduced GPA:  9.43
+   #   Policy:          legacy@1
+   #   Algorithm:       1.0
+   #   Records Used:    2
+   ```
+   The original calculation is verified and reproduced with zero drift.
 
 ## How it's supposed to work
 
@@ -281,6 +345,7 @@ Malformed CSV input is never converted into a successful empty JSON result for `
 - `grade_tracker/audit_log.py`: versioned audit event schema, canonical serialization, and SHA-256 hash-chain verification
 - `grade_tracker/audit_txn.py`: crash-recoverable write-ahead transaction journal coordinating CSV mutations and audit logs
 - `grade_tracker/rollback.py`: conflict checking, record inversion, and compensating rollback transactions
+- `grade_tracker/snapshot.py`: reproducible GPA calculation snapshots, deterministic reproduction, and integrity digests
 - `grade_tracker/cli.py`: the commands, and reading and writing the CSV
 - `grade_tracker/export.py`: the HTML report
 - `tests/`: tests, run with `python3 -m unittest discover tests`
