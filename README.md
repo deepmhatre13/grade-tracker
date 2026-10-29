@@ -347,6 +347,7 @@ Malformed CSV input is never converted into a successful empty JSON result for `
 - `grade_tracker/rollback.py`: conflict checking, record inversion, and compensating rollback transactions
 - `grade_tracker/snapshot.py`: reproducible GPA calculation snapshots, deterministic reproduction, and integrity digests
 - `grade_tracker/cli.py`: the commands, and reading and writing the CSV
+- `grade_tracker/policies.py`: versioned grading policies, threshold rules, and registry
 - `grade_tracker/export.py`: the HTML report
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 
