@@ -45,6 +45,18 @@ from grade_tracker.rollback import (
     RollbackConflictError,
     rollback_mutation,
 )
+from grade_tracker.snapshot import (
+    SnapshotError,
+    SnapshotNotFoundError,
+    SnapshotExistsError,
+    SnapshotIntegrityError,
+    UnsupportedVersionError,
+    SnapshotCalculationError,
+    create_snapshot,
+    inspect_snapshot,
+    reproduce_snapshot,
+    list_snapshots,
+)
 from grade_tracker.export import build_html
 from grade_tracker.policies import (
     UnknownPolicyError,
@@ -2619,6 +2631,161 @@ def cmd_rollback(args):
         print(f"Successfully rolled back {op} mutation (event {event_id}): {count} {noun} affected.")
 
 
+def cmd_snapshot(args):
+    """Handle snapshot operations: create, inspect, reproduce, and list."""
+    action = getattr(args, "snapshot_action", None)
+    if not action:
+        print("Error: snapshot subcommand required (create, inspect, reproduce, list)", file=sys.stderr)
+        raise SystemExit(2)
+
+    as_json = _format_name(args) == JSON_FORMAT
+
+    if action == "create":
+        try:
+            policy = _resolve_policy_argument(args)
+        except UnknownPolicyError as exc:
+            if as_json:
+                _emit_json(_policy_error_payload("snapshot create", exc))
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+
+        try:
+            snap = create_snapshot(
+                csv_path=args.data,
+                calculation_type=args.type,
+                student_id=args.student_id,
+                semester=args.semester,
+                policy=policy,
+                snapshot_id=args.snapshot_id,
+                description=args.description,
+            )
+        except (SnapshotError, ValueError) as exc:
+            if as_json:
+                _emit_json({
+                    "command": "snapshot create",
+                    "error": {"code": type(exc).__name__, "message": str(exc)},
+                })
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if as_json:
+            _emit_json({"command": "snapshot create", "snapshot": snap})
+            return
+
+        res = snap["result"]
+        gpa_str = f"{res['gpa']:.2f}" if res.get("gpa") is not None else "N/A"
+        print(f"Snapshot created successfully: {snap['snapshot_id']}")
+        print(f"  Type:        {snap['calculation_type'].upper()}")
+        print(f"  Student:     {snap['student_id']}")
+        if snap.get("semester"):
+            print(f"  Semester:    {snap['semester']}")
+        print(f"  GPA:         {gpa_str}")
+        print(f"  Policy:      {snap['policy']['name']}")
+        print(f"  Records:     {len(snap['input_records'])}")
+        print(f"  Digest:      {snap['content_digest']}")
+
+    elif action == "inspect":
+        try:
+            info = inspect_snapshot(csv_path=args.data, snapshot_id=args.snapshot_id)
+        except (SnapshotError, ValueError) as exc:
+            if as_json:
+                _emit_json({
+                    "command": "snapshot inspect",
+                    "error": {"code": type(exc).__name__, "message": str(exc)},
+                })
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if as_json:
+            _emit_json({"command": "snapshot inspect", "snapshot": info})
+            return
+
+        gpa_str = f"{info['recorded_gpa']:.2f}" if info.get("recorded_gpa") is not None else "N/A"
+        digest_status = "valid" if info.get("digest_valid") else "INVALID (corrupted or tampered)"
+        print(f"Snapshot: {info['snapshot_id']}")
+        print(f"  Schema:      {info['schema_version']} (supported: {info['schema_supported']})")
+        print(f"  Algorithm:   {info['algorithm_version']} (supported: {info['algorithm_supported']})")
+        print(f"  Created:     {info['created_at']}")
+        print(f"  Type:        {str(info['calculation_type']).upper()}")
+        print(f"  Student:     {info['student_id']}")
+        if info.get("semester"):
+            print(f"  Semester:    {info['semester']}")
+        print(f"  Policy:      {info['policy_name']}")
+        print(f"  Records:     {info['input_record_count']}")
+        print(f"  GPA:         {gpa_str}")
+        print(f"  Points:      {info['recorded_total_points']}")
+        print(f"  Credits:     {info['recorded_total_credits']}")
+        print(f"  Digest:      {info['content_digest']} ({digest_status})")
+        if info.get("description"):
+            print(f"  Description: {info['description']}")
+
+    elif action == "reproduce":
+        try:
+            rep = reproduce_snapshot(csv_path=args.data, snapshot_id=args.snapshot_id)
+        except (SnapshotError, ValueError) as exc:
+            if as_json:
+                _emit_json({
+                    "command": "snapshot reproduce",
+                    "error": {"code": type(exc).__name__, "message": str(exc)},
+                })
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if as_json:
+            _emit_json({"command": "snapshot reproduce", "reproduction": rep})
+            return
+
+        status_str = "MATCH (VERIFIED)" if rep["reproduced"] else "MISMATCH"
+        rec_gpa = f"{rep['recorded_gpa']:.2f}" if rep.get("recorded_gpa") is not None else "N/A"
+        rep_gpa = f"{rep['reproduced_gpa']:.2f}" if rep.get("reproduced_gpa") is not None else "N/A"
+
+        print(f"Reproduced snapshot: {rep['snapshot_id']}")
+        print(f"  Status:          {status_str}")
+        print(f"  Recorded GPA:    {rec_gpa}")
+        print(f"  Reproduced GPA:  {rep_gpa}")
+        print(f"  Policy:          {rep['policy_name']}")
+        print(f"  Algorithm:       {rep['algorithm_version']}")
+        print(f"  Records Used:    {rep['records_count']}")
+        if not rep["reproduced"]:
+            print("  Warning: reproduced GPA does not match recorded snapshot result!", file=sys.stderr)
+            raise SystemExit(1)
+
+    elif action == "list":
+        try:
+            items = list_snapshots(csv_path=args.data)
+        except (SnapshotError, ValueError) as exc:
+            if as_json:
+                _emit_json({
+                    "command": "snapshot list",
+                    "error": {"code": type(exc).__name__, "message": str(exc)},
+                })
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if as_json:
+            _emit_json({"command": "snapshot list", "count": len(items), "snapshots": items})
+            return
+
+        if not items:
+            print("No snapshots found.")
+            return
+
+        print(f"Found {len(items)} snapshot(s):")
+        for item in items:
+            gpa_val = f"{item['recorded_gpa']:.2f}" if item.get("recorded_gpa") is not None else "N/A"
+            status = "OK" if item.get("digest_valid") else "CORRUPTED"
+            sem = f" (sem {item['semester']})" if item.get("semester") else ""
+            print(
+                f"  {item['snapshot_id']:<36} {str(item['calculation_type']).upper():<5} "
+                f"Student: {item['student_id']:<10}{sem:<10} GPA: {gpa_val:<6} [{status}]"
+            )
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
@@ -2863,6 +3030,57 @@ def main():
         help="Optional reason describing the rollback mutation",
     )
     p_rollback.set_defaults(func=cmd_rollback)
+
+    # snapshot
+    p_snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Manage reproducible GPA calculation snapshots",
+        description=(
+            "Create, inspect, reproduce, and list reproducible GPA calculation "
+            "snapshots. Snapshots preserve exact input grade records, complete "
+            "effective policy configurations, calculation metadata, and content digests "
+            "allowing historical GPA results to be independently reproduced."
+        ),
+    )
+    snap_subparsers = p_snapshot.add_subparsers(
+        dest="snapshot_action", help="Snapshot actions: create, inspect, reproduce, list"
+    )
+
+    # snapshot create
+    p_snap_create = snap_subparsers.add_parser(
+        "create", help="Create a new GPA calculation snapshot"
+    )
+    p_snap_create.add_argument("type", choices=["sgpa", "cgpa"], help="Calculation type ('sgpa' or 'cgpa')")
+    p_snap_create.add_argument("student_id", help="Student ID to calculate GPA for")
+    p_snap_create.add_argument("--semester", default=None, help="Semester (required for SGPA, optional for CGPA)")
+    p_snap_create.add_argument("--snapshot-id", default=None, help="Optional custom unique snapshot ID")
+    p_snap_create.add_argument("--description", default=None, help="Optional descriptive notes")
+    _add_policy_argument(p_snap_create)
+    _add_format_argument(p_snap_create)
+    p_snap_create.set_defaults(func=cmd_snapshot)
+
+    # snapshot inspect
+    p_snap_inspect = snap_subparsers.add_parser(
+        "inspect", help="Inspect an existing snapshot's metadata and integrity"
+    )
+    p_snap_inspect.add_argument("snapshot_id", help="Unique snapshot identifier")
+    _add_format_argument(p_snap_inspect)
+    p_snap_inspect.set_defaults(func=cmd_snapshot)
+
+    # snapshot reproduce
+    p_snap_reproduce = snap_subparsers.add_parser(
+        "reproduce", help="Reproduce a GPA calculation using preserved historical inputs and policy"
+    )
+    p_snap_reproduce.add_argument("snapshot_id", help="Unique snapshot identifier")
+    _add_format_argument(p_snap_reproduce)
+    p_snap_reproduce.set_defaults(func=cmd_snapshot)
+
+    # snapshot list
+    p_snap_list = snap_subparsers.add_parser(
+        "list", help="List all available GPA snapshots"
+    )
+    _add_format_argument(p_snap_list)
+    p_snap_list.set_defaults(func=cmd_snapshot)
 
     args = parser.parse_args()
     if not args.command:
