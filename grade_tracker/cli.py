@@ -57,6 +57,16 @@ from grade_tracker.snapshot import (
     reproduce_snapshot,
     list_snapshots,
 )
+from grade_tracker.integrity import (
+    IntegrityCheckError,
+    RepairConfirmationRequiredError,
+    StaleRepairPlanError,
+    UnrepairableStateError,
+    generate_repair_plan,
+    execute_repair_plan,
+    format_integrity_report_text,
+    run_cross_file_verification,
+)
 from grade_tracker.export import build_html
 from grade_tracker.policies import (
     UnknownPolicyError,
@@ -2787,6 +2797,81 @@ def cmd_snapshot(args):
 
 
 
+
+
+def cmd_integrity_check(args):
+    """Run read-only cross-file integrity diagnostics."""
+    try:
+        report = run_cross_file_verification(csv_path=args.data)
+    except IntegrityCheckError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    fmt = getattr(args, "format", "text") or "text"
+    if fmt == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_integrity_report_text(report))
+
+    # Exit code: 0 if clean (ok), 1 if warnings, errors, or unverifiable issues
+    overall = report.get("overall_status")
+    if overall == "ok":
+        raise SystemExit(0)
+    else:
+        raise SystemExit(1)
+
+
+def cmd_integrity_repair(args):
+    """Run safe, verified repair for repairable integrity issues."""
+    dry_run = getattr(args, "dry_run", False)
+    confirmed = getattr(args, "yes", False)
+    reason = getattr(args, "reason", None)
+    fmt = getattr(args, "format", "text") or "text"
+
+    try:
+        result = execute_repair_plan(
+            csv_path=args.data,
+            confirmed=confirmed,
+            dry_run=dry_run,
+            reason=reason,
+        )
+    except RepairConfirmationRequiredError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except UnrepairableStateError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except StaleRepairPlanError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except (IntegrityCheckError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    if fmt == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        if dry_run:
+            actions = result.get("actions_planned", [])
+            print(f"Integrity Repair Preview (Dry Run): {len(actions)} actions would be performed.")
+            for act in actions:
+                print(f"  - [{act.get('action')}] {act.get('path')}: {act.get('description')}")
+            if not actions:
+                print("  No repairable issues detected.")
+            print("No changes were made. Pass --yes to confirm and apply repairs.")
+        else:
+            executed = result.get("actions_executed", [])
+            print(f"Integrity Repair Completed: {len(executed)} actions executed successfully.")
+            for act in executed:
+                preserved = f" (preserved as {act['preserved_as']})" if act.get("preserved_as") else ""
+                print(f"  - [{act.get('action')}] {act.get('artifact')}{preserved}")
+            post_rep = result.get("post_repair_report", {})
+            post_status = post_rep.get("overall_status", "unknown")
+            print(f"Post-repair verification status: {post_status}")
+
+    if not result.get("success", True) and not dry_run:
+        raise SystemExit(1)
+    raise SystemExit(0)
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
     parser.add_argument("--data", default=DEFAULT_DATA_PATH, help="Path to grades.csv")
@@ -3082,6 +3167,43 @@ def main():
     _add_format_argument(p_snap_list)
     p_snap_list.set_defaults(func=cmd_snapshot)
 
+    # check (cross-file integrity diagnostic)
+    p_check = subparsers.add_parser(
+        "check",
+        help="Check cross-file integrity across dataset, audit log, backups, snapshots, and journals",
+        description=(
+            "Read-only cross-file integrity diagnostic. Inspects active dataset, audit log, "
+            "pending transaction journal, backup pairing, snapshots, and orphaned temp files. "
+            "Exits 0 if clean, 1 if issues or warnings detected."
+        ),
+    )
+    _add_format_argument(p_check)
+    p_check.set_defaults(func=cmd_integrity_check)
+
+    # repair (safe, confirmed repair workflow)
+    p_repair = subparsers.add_parser(
+        "repair",
+        help="Safely repair detectable cross-file inconsistencies with explicit confirmation",
+        description=(
+            "Safely execute verified repair actions for unambiguous transaction journals "
+            "and orphaned temporary files. Preserves original artifacts before modification. "
+            "Requires --yes to execute; preview with --dry-run."
+        ),
+    )
+    p_repair.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Preview proposed repair actions without modifying any files",
+    )
+    p_repair.add_argument(
+        "--yes", "-y", action="store_true", default=False,
+        help="Confirm execution of proposed safe repairs",
+    )
+    p_repair.add_argument(
+        "--reason", default=None,
+        help="Optional explanation/reason recorded in the audit repair event",
+    )
+    _add_format_argument(p_repair)
+    p_repair.set_defaults(func=cmd_integrity_repair)
     args = parser.parse_args()
     if not args.command:
         parser.print_help()

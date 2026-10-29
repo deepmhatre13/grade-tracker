@@ -37,6 +37,10 @@ On Windows, use `python` instead of `python3`.
 | `snapshot reproduce <snapshot_id> [--format json]` | Independently recalculates GPA strictly using preserved historical inputs and policy, comparing against the recorded result |
 | `snapshot list [--format json]` | Lists all available GPA calculation snapshots |
 
+| `check [--format json]` | Diagnostic cross-file integrity check across dataset, audit log, pending journals, backups, snapshots, and temporary files; `--format json` emits structured JSON report |
+| `repair [--dry-run] [--yes] [--reason TEXT] [--format json]` | Safely repairs verified, unambiguous cross-file inconsistencies (interrupted journals, orphaned temporary files) with explicit confirmation |
+
+
 
 
 `delete` performs transactional bulk deletion of grade records matching explicit selection criteria:
@@ -426,6 +430,66 @@ When a crash or process termination occurs mid-transaction:
 - **Local filesystem boundary**: The hash chain guarantees cryptographic tamper-*evidence*, not access control. An adversary with write permissions to the filesystem could rewrite the entire CSV and regenerate a valid hash chain from sequence 1. External anchoring (such as remote replication, detached signatures, or write-once storage) is required to detect complete history rewrites.
 - **Advisory locking**: Concurrency guarantees rely on cooperative inter-process locks (`_InterProcessLock`). Uncoordinated processes writing directly to `grades.csv` bypass transactional journaling.
 - **Storage durability**: Crash recovery relies on filesystem barrier semantics and `os.fsync`. Hardware-level write cache failures can compromise un-flushed disk blocks.
+
+## Cross-File Integrity Verification and Safe Repair
+
+Grade Tracker maintains multiple interrelated storage artifacts:
+- **Active Dataset**: `data/grades.csv` holding canonical grade records.
+- **Tamper-Evident Audit Log**: `data/grades.audit.jsonl` maintaining an unbroken SHA-256 hash chain of mutations.
+- **Write-Ahead Transaction Journal**: `data/grades.audit-pending.json` tracking multi-file commits in progress.
+- **Backups & Manifests**: `data/backups/grades-*.csv` paired with `grades-*.json` integrity manifests.
+- **Temporary Files**: Working files like `.grades-*.tmp`, `.audit-journal-*.tmp`, etc.
+- **Calculation Snapshots**: `data/snapshots/*.json` holding frozen GPA calculations (when present).
+
+While each file may be individually valid, interruptions, crashes, or uncoordinated filesystem edits can introduce cross-file desynchronization. The `check` and `repair` commands provide a principled diagnostic and recovery workflow.
+
+### Verification (`check`)
+
+`check` performs a strictly read-only inspection of all related artifacts without mutating any files:
+
+```bash
+python -m grade_tracker check
+python -m grade_tracker check --format json
+```
+
+#### Diagnostic checks performed:
+1. **Active Dataset Integrity**: Verifies CSV presence, syntax validity, required canonical columns (`student_id`, `subject`, `score`, `max_score`, `date`, `credits`, `semester`), and internal consistency.
+2. **Audit Log & Hash Chain**: Validates presence, verifies SHA-256 hash-chain integrity from genesis to head, sequence continuity, and dataset ID consistency. Flags tampered entries as `unverifiable`.
+3. **Dataset & Audit Synchronization**: Checks for untracked mutations or desynchronization between active records and the audit log head.
+4. **Transaction Journal State**: Inspects pending journals for clean, recoverable (`commit_unfinalized`, `uncommitted_journal`), or ambiguous multi-file states.
+5. **Backup & Manifest Pairing**: Verifies that every backup CSV is paired with a valid JSON manifest, matches the manifest's expected SHA-256 digest, and flags orphaned backups or missing files.
+6. **Orphaned Temporary Files**: Detects dangling `.tmp` files leftover from interrupted processes.
+7. **Snapshot Content Digest**: If a `data/snapshots/` directory exists, validates that stored calculation snapshots match their canonical SHA-256 content digest.
+
+#### Exit Codes:
+- `0`: All evaluated checks passed with status `ok`.
+- `1`: Inconsistencies, warnings, errors, or unverifiable states detected.
+
+### Safe Repair (`repair`)
+
+The `repair` workflow resolves detectable and unambiguous inconsistencies under an advisory inter-process lock (`_InterProcessLock`):
+
+```bash
+# Preview proposed repair actions without modifying files
+python -m grade_tracker repair --dry-run
+
+# Execute confirmed safe repair actions
+python -m grade_tracker repair --yes --reason "Post-crash recovery"
+```
+
+#### Safety Invariants & Policies:
+- **Safety-First Fail Closed**: Never silently reconstruct, guess, overwrite, or reconcile ambiguous data. If a dataset matches neither the pre-transaction nor post-transaction checksum, or if an audit hash chain is broken, repair aborts with `UnrepairableStateError` and requires manual administrator review.
+- **Mandatory Confirmation**: Executing repairs requires the explicit `--yes` (`-y`) confirmation flag. Invoking `repair` without `--yes` aborts with exit code 2 and leaves all files untouched.
+- **Dry-Run Preview**: `--dry-run` calculates and displays proposed repair actions with zero filesystem mutations.
+- **Pre-Repair Artifact Preservation**: Before modifying or discarding any artifact (e.g. pending journal), a timestamped copy is preserved in `data/preservations/` (e.g. `journal-pre-repair-*.json`).
+- **Freshness & Stale Plan Detection**: Re-verifies all artifact fingerprints immediately before execution under inter-process lock. If any artifact changed between plan generation and lock acquisition, repair aborts with `StaleRepairPlanError`.
+- **Post-Repair Re-verification**: Re-runs the complete cross-file verification engine immediately after applying repairs to guarantee that the system has transitioned to a clean state.
+- **Audit Logging of Repairs**: Successful repairs commit an audit event with operation `"repair"` recording executed actions, actor, and reason.
+
+#### Exit Codes:
+- `0`: Repairs completed successfully (or dry-run preview completed cleanly).
+- `1`: Unrepairable inconsistencies detected, stale plan error, or post-repair verification failed.
+- `2`: Usage error, invalid arguments, or missing `--yes` confirmation.
 
 ## Contributing
 
