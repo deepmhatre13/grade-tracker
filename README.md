@@ -25,12 +25,8 @@ On Windows, use `python` instead of `python3`.
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
 | `policies [--format json]` | Lists the registered grading policies; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester> [--allow-duplicate]` | Adds a mark; opt in when recording a separate same-day assessment |
-
-| `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
-| `delete [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD] [--dry-run] [--yes]` | Bulk deletes matching grade records under inter-process lock; requires confirmation or dry-run |
-
 | `edit <student_id> <semester> <subject> <date> [--current-score N] [--current-max-score N] [--current-credits N] [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark; current-value selectors distinguish same-day assessments |
-
+| `delete [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD] [--dry-run] [--yes]` | Bulk deletes matching grade records under inter-process lock; requires confirmation or dry-run |
 | `export [--output path] [--policy NAME]` | Writes an HTML report, `reports/index.html` by default |
 | `validate [--format json]` | Audits the CSV for malformed or invalid records, without changing the file; `--format json` emits a JSON document |
 | `backup` | Creates a verified, timestamped backup of the CSV with SHA-256 metadata |
@@ -53,8 +49,6 @@ On Windows, use `python` instead of `python3`.
 - **Transactionality & Concurrency**: Deletion coordinates under the destination CSV's advisory inter-process lock (`_InterProcessLock`). The file is audited for integrity (`audit_grades_csv`), read, and filtered under lock. Remaining records are written to a temporary file in the destination directory, flushed and `fsync`ed, and atomically replaced (`os.replace`). Order and contents of non-deleted records are strictly preserved.
 - **Exit Codes & Errors**: Exits 0 on successful deletion, dry run, or 0 matches. Exits 2 on invalid selectors, missing confirmation, corrupt CSV data, or I/O errors with diagnostics printed to `stderr`.
 
-
-`edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. Only the options you pass are changed — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
 
 `edit` corrects an existing record without touching the CSV by hand. The record is identified by its current assessment identity: `student_id`, `semester`, `subject`, and `date`. If multiple same-day assessments share that identity, add one or more pre-edit selectors (`--current-score`, `--current-max-score`, or `--current-credits`) until exactly one record matches. Only the change options you pass are modified — `--score`, `--max-score`, `--credits`, `--student-id`, `--semester`, `--subject`, `--date` — and every omitted option keeps the record's current value (it is never replaced with a default). At least one change option is required.
 
